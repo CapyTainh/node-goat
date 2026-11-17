@@ -1,5 +1,6 @@
 name: Scheduled Security Scan (CodeQL, Semgrep, Trivy & DefectDojo)
 on:
+  pull_request:
   schedule:
     - cron: '0 0,8,16 * * *'
   workflow_dispatch:
@@ -13,10 +14,10 @@ jobs:
       security-events: write
       actions: read
     steps:
-      - name: Checkout Default Branch
+      - name: Checkout Branch
         uses: actions/checkout@v4
 
-      # --- 1. GitHub CodeQL (Deep Semantic SAST -> SARIF) ---
+      # --- 1. GitHub CodeQL (Uploads to GitHub Security/PRs & saves SARIF for DefectDojo) ---
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -25,7 +26,7 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
-          upload: false
+          upload: true
           output: sarif-results
 
       # --- 2. Semgrep Community Edition (Rule-based SAST -> JSON) ---
@@ -45,8 +46,9 @@ jobs:
           format: 'json'
           output: 'trivy-results.json'
 
-      # --- 4. Import CodeQL SARIF into DefectDojo (Tag: sast, codeql) ---
+      # --- 4. Import CodeQL SARIF into DefectDojo (Skipped on Pull Requests) ---
       - name: Import CodeQL SARIF to DefectDojo
+        if: github.event_name != 'pull_request'
         run: |
           SARIF_FILE=$(ls sarif-results/*.sarif | head -n 1)
           echo "Uploading $SARIF_FILE to DefectDojo..."
@@ -62,8 +64,9 @@ jobs:
             -F "auto_create_context=true" \
             -F "close_old_findings=true"
 
-      # --- 5. Import Semgrep Report into DefectDojo (Tag: sast, semgrep) ---
+      # --- 5. Import Semgrep Report into DefectDojo (Skipped on Pull Requests) ---
       - name: Import Semgrep Report to DefectDojo
+        if: github.event_name != 'pull_request'
         run: |
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
@@ -77,8 +80,9 @@ jobs:
             -F "auto_create_context=true" \
             -F "close_old_findings=true"
 
-      # --- 6. Import Trivy Report into DefectDojo (Tag: sca, secrets, trivy) ---
+      # --- 6. Import Trivy Report into DefectDojo (Skipped on Pull Requests) ---
       - name: Import Trivy Report to DefectDojo
+        if: github.event_name != 'pull_request'
         run: |
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
