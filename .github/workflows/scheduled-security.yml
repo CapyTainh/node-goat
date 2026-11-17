@@ -14,7 +14,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # --- 1. SonarQube Cloud Scan ---
+      # --- 1. SonarQube Cloud (Deep SAST) ---
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v8.4.1
         env:
@@ -26,13 +26,13 @@ jobs:
             -Dsonar.sources=.
             -Dsonar.exclusions=**/node_modules/**,**/test/**
 
-      # --- 2. Semgrep Community Edition (Open-Source SAST) ---
+      # --- 2. Semgrep Community Edition (Rule-based SAST) ---
       - name: Semgrep CE SAST Scan
         run: |
           pip install semgrep
           semgrep scan --config auto --json -o semgrep-results.json
 
-      # --- 3. Trivy (Dependency CVEs & Secrets) ---
+      # --- 3. Trivy (SCA Dependencies & Hardcoded Secrets) ---
       - name: Trivy Filesystem & Secret Scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -43,11 +43,11 @@ jobs:
           format: 'json'
           output: 'trivy-results.json'
 
-      # --- 4. Export SonarCloud Issues, Convert to DefectDojo Format & Upload ---
-      - name: Export SonarCloud Issues & Import to DefectDojo
+      # --- 4. Normalize & Import SonarQube Vulnerabilities (Tag: sast, sonarqube) ---
+      - name: Export & Normalize SonarCloud Vulnerabilities
         run: |
           sleep 15
-          API_URL="https://sonarcloud.io/api/issues/search?componentKeys=CapyTainh_node-goat&resolved=false&ps=500"
+          API_URL="https://sonarcloud.io/api/issues/search?componentKeys=CapyTainh_node-goat&types=VULNERABILITY&resolved=false&ps=500"
           HTTP_CODE=$(curl -s -o sonar-raw.json -w "%{http_code}" "$API_URL")
 
           if [ "$HTTP_CODE" != "200" ]; then
@@ -66,27 +66,39 @@ jobs:
           for i in raw.get("issues", []):
               comp = i.get("component", "")
               file_path = comp.split(":", 1)[1] if ":" in comp else comp
-              msg = i.get("message", "Issue")
+              msg = i.get("message", "Vulnerability")
               rule = i.get("rule", "")
-              issue_type = i.get("type", "")
-              findings.append({
+              tags = i.get("tags", [])
+
+              cwe = None
+              for t in tags:
+                  if t.startswith("cwe-") and t[4:].isdigit():
+                      cwe = int(t[4:])
+                      break
+
+              item = {
                   "title": f"[SonarQube] {msg[:200]}",
-                  "description": f"Rule: {rule}\nType: {issue_type}\nMessage: {msg}",
+                  "description": f"**Scanner:** SonarQube Cloud (SAST)\n**Rule:** {rule}\n**Tags:** {', '.join(tags)}\n\n{msg}",
                   "severity": sev_map.get(i.get("severity", "MAJOR"), "Medium"),
                   "file_path": file_path,
                   "line": i.get("line", 1),
                   "active": True,
+                  "tags": ["sast", "sonarqube"],
                   "unique_id_from_tool": i.get("key")
-              })
+              }
+              if cwe:
+                  item["cwe"] = cwe
+              findings.append(item)
 
           json.dump({"findings": findings}, open("sonar-dojo.json", "w"))
-          print(f"Prepared {len(findings)} SonarQube findings for DefectDojo")
+          print(f"Normalized {len(findings)} SonarQube vulnerabilities")
           EOF
 
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=Generic Findings Import" \
             -F "test_title=SonarQube SAST" \
+            -F "tags=sast,sonarqube" \
             -F "file=@sonar-dojo.json" \
             -F "product_name=node-goat" \
             -F "product_type_name=GitHub Repositories" \
@@ -94,12 +106,14 @@ jobs:
             -F "auto_create_context=true" \
             -F "close_old_findings=true"
 
+      # --- 5. Import Semgrep Report (Tag: sast, semgrep) ---
       - name: Import Semgrep Report to DefectDojo
         run: |
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=Semgrep JSON Report" \
             -F "test_title=Semgrep CE SAST" \
+            -F "tags=sast,semgrep" \
             -F "file=@semgrep-results.json" \
             -F "product_name=node-goat" \
             -F "product_type_name=GitHub Repositories" \
@@ -107,12 +121,14 @@ jobs:
             -F "auto_create_context=true" \
             -F "close_old_findings=true"
 
+      # --- 6. Import Trivy Report (Tag: sca, secrets, trivy) ---
       - name: Import Trivy Report to DefectDojo
         run: |
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=Trivy Scan" \
             -F "test_title=Trivy SCA & Secrets" \
+            -F "tags=sca,secrets,trivy" \
             -F "file=@trivy-results.json" \
             -F "product_name=node-goat" \
             -F "product_type_name=GitHub Repositories" \
