@@ -43,19 +43,39 @@ jobs:
           format: 'json'
           output: 'trivy-results.json'
 
-      # --- 4. Send All 3 Reports to DefectDojo ---
+      # --- 4. Export SonarCloud Issues, Convert to DefectDojo Format & Upload ---
       - name: Export SonarCloud Issues & Import to DefectDojo
         run: |
           sleep 15
-          curl -s -f -H "Authorization: Bearer ${{ secrets.SONAR_TOKEN }}" \
+          curl -s -f -u "${{ secrets.SONAR_TOKEN }}:" \
             "https://sonarcloud.io/api/issues/search?componentKeys=CapyTainh_node-goat&resolved=false&ps=500" \
-            -o sonar-results.json
+            -o sonar-raw.json
+
+          python3 -c '
+          import json
+          sev_map = {"BLOCKER": "Critical", "CRITICAL": "High", "MAJOR": "Medium", "MINOR": "Low", "INFO": "Info"}
+          raw = json.load(open("sonar-raw.json"))
+          findings = []
+          for i in raw.get("issues", []):
+              comp = i.get("component", "")
+              file_path = comp.split(":", 1)[1] if ":" in comp else comp
+              findings.append({
+                  "title": f"[SonarQube] {i.get(\"message\", \"Issue\")[:200]}",
+                  "description": f"Rule: {i.get(\"rule\")}\nType: {i.get(\"type\")}\nMessage: {i.get(\"message\")}",
+                  "severity": sev_map.get(i.get("severity", "MAJOR"), "Medium"),
+                  "file_path": file_path,
+                  "line": i.get("line", 1),
+                  "unique_id_from_tool": i.get("key")
+              })
+          json.dump({"findings": findings}, open("sonar-dojo.json", "w"))
+          print(f"Prepared {len(findings)} SonarQube findings for DefectDojo")
+          '
 
           curl -i -f -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
-            -F "scan_type=SonarQube Scan" \
+            -F "scan_type=Generic Findings Import" \
             -F "test_title=SonarQube SAST" \
-            -F "file=@sonar-results.json" \
+            -F "file=@sonar-dojo.json" \
             -F "product_name=node-goat" \
             -F "product_type_name=GitHub Repositories" \
             -F "engagement_name=Scheduled CI Scans" \
