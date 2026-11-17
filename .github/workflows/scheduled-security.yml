@@ -43,7 +43,7 @@ jobs:
           format: 'json'
           output: 'trivy-results.json'
 
-      # --- 4. Normalize & Import SonarQube Vulnerabilities (Tag: sast, sonarqube) ---
+      # --- 4. Export, Enrich & Import SonarQube Vulnerabilities (Tag: sast, sonarqube) ---
       - name: Export & Normalize SonarCloud Vulnerabilities
         run: |
           sleep 15
@@ -57,7 +57,50 @@ jobs:
           fi
 
           python3 - << 'EOF'
+          import html
           import json
+          import re
+          import urllib.parse
+          import urllib.request
+
+          def clean_html(raw_html):
+              if not raw_html:
+                  return ""
+              text = re.sub(r"<br\s*/?>|</p>|</li>|</h[1-6]>", "\n", raw_html)
+              text = re.sub(r"<[^>]+>", "", text)
+              text = html.unescape(text)
+              return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+          rule_cache = {}
+
+          def get_rule_details(rule_key):
+              if rule_key in rule_cache:
+                  return rule_cache[rule_key]
+              info = {"cwe": None, "mitigation": "", "impact": "", "references": ""}
+              try:
+                  url = f"https://sonarcloud.io/api/rules/show?key={urllib.parse.quote(rule_key)}"
+                  with urllib.request.urlopen(url, timeout=10) as resp:
+                      rule = json.loads(resp.read().decode()).get("rule", {})
+
+                  for std in rule.get("securityStandards", []):
+                      if std.startswith("cwe:"):
+                          cwe_num = std.split(":", 1)[1]
+                          if cwe_num.isdigit():
+                              info["cwe"] = int(cwe_num)
+                              break
+
+                  sections = {s.get("key"): clean_html(s.get("content", "")) for s in rule.get("descriptionSections", [])}
+                  info["impact"] = sections.get("root_cause") or clean_html(rule.get("htmlDesc", ""))[:1500]
+                  info["mitigation"] = sections.get("how_to_fix", "")
+                  refs = sections.get("resources", "")
+                  rule_slug = rule_key.split(":", 1)[1] if ":" in rule_key else rule_key
+                  sonar_url = f"https://rules.sonarsource.com/search/?search={rule_slug}"
+                  info["references"] = f"{refs}\n\nSonarSource Rule Reference: {sonar_url}".strip()
+              except Exception as e:
+                  print(f"Warning: could not fetch rule {rule_key}: {e}")
+
+              rule_cache[rule_key] = info
+              return info
 
           sev_map = {"BLOCKER": "Critical", "CRITICAL": "High", "MAJOR": "Medium", "MINOR": "Low", "INFO": "Info"}
           raw = json.load(open("sonar-raw.json"))
@@ -68,17 +111,11 @@ jobs:
               file_path = comp.split(":", 1)[1] if ":" in comp else comp
               msg = i.get("message", "Vulnerability")
               rule = i.get("rule", "")
-              tags = i.get("tags", [])
-
-              cwe = None
-              for t in tags:
-                  if t.startswith("cwe-") and t[4:].isdigit():
-                      cwe = int(t[4:])
-                      break
+              rule_info = get_rule_details(rule) if rule else {}
 
               item = {
                   "title": f"[SonarQube] {msg[:200]}",
-                  "description": f"**Scanner:** SonarQube Cloud (SAST)\n**Rule:** {rule}\n**Tags:** {', '.join(tags)}\n\n{msg}",
+                  "description": f"**Scanner:** SonarQube Cloud (SAST)\n**Rule:** {rule}\n**File:** {file_path}\n\n{msg}",
                   "severity": sev_map.get(i.get("severity", "MAJOR"), "Medium"),
                   "file_path": file_path,
                   "line": i.get("line", 1),
@@ -86,12 +123,19 @@ jobs:
                   "tags": ["sast", "sonarqube"],
                   "unique_id_from_tool": i.get("key")
               }
-              if cwe:
-                  item["cwe"] = cwe
+              if rule_info.get("cwe"):
+                  item["cwe"] = rule_info["cwe"]
+              if rule_info.get("mitigation"):
+                  item["mitigation"] = rule_info["mitigation"]
+              if rule_info.get("impact"):
+                  item["impact"] = rule_info["impact"]
+              if rule_info.get("references"):
+                  item["references"] = rule_info["references"]
+
               findings.append(item)
 
           json.dump({"findings": findings}, open("sonar-dojo.json", "w"))
-          print(f"Normalized {len(findings)} SonarQube vulnerabilities")
+          print(f"Enriched and normalized {len(findings)} SonarQube vulnerabilities")
           EOF
 
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
