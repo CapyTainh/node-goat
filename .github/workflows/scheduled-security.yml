@@ -1,0 +1,34 @@
+name: Scheduled Security Scan (SonarQube & Trivy)
+on:
+  schedule:
+    - cron: '0 0,8,16 * * *'
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    name: SonarQube & Trivy Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Default Branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v8.5.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=capytainh
+            -Dsonar.projectKey=CapyTainh_node-goat
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/node_modules/**,**/test/**
+
+      - name: Trivy Filesystem & Secret Scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln,secret'
+          severity: 'CRITICAL,HIGH'
