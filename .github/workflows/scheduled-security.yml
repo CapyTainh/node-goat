@@ -47,9 +47,19 @@ jobs:
       - name: Export SonarCloud Issues & Import to DefectDojo
         run: |
           sleep 15
-          curl -s -f -u "${{ secrets.SONAR_TOKEN }}:" \
-            "https://sonarcloud.io/api/issues/search?componentKeys=CapyTainh_node-goat&resolved=false&ps=500" \
-            -o sonar-raw.json
+          API_URL="https://sonarcloud.io/api/issues/search?componentKeys=CapyTainh_node-goat&resolved=false&ps=500"
+          HTTP_CODE=$(curl -s -o sonar-raw.json -w "%{http_code}" -u "${{ secrets.SONAR_TOKEN }}:" "$API_URL")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Token auth returned HTTP $HTTP_CODE, retrying via public SonarCloud API..."
+            HTTP_CODE=$(curl -s -o sonar-raw.json -w "%{http_code}" "$API_URL")
+          fi
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "SonarCloud API failed with HTTP $HTTP_CODE:"
+            cat sonar-raw.json
+            exit 1
+          fi
 
           python3 -c '
           import json
@@ -65,13 +75,14 @@ jobs:
                   "severity": sev_map.get(i.get("severity", "MAJOR"), "Medium"),
                   "file_path": file_path,
                   "line": i.get("line", 1),
+                  "active": True,
                   "unique_id_from_tool": i.get("key")
               })
           json.dump({"findings": findings}, open("sonar-dojo.json", "w"))
           print(f"Prepared {len(findings)} SonarQube findings for DefectDojo")
           '
 
-          curl -i -f -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+          curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=Generic Findings Import" \
             -F "test_title=SonarQube SAST" \
@@ -84,7 +95,7 @@ jobs:
 
       - name: Import Semgrep Report to DefectDojo
         run: |
-          curl -i -f -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+          curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=Semgrep JSON Report" \
             -F "test_title=Semgrep CE SAST" \
@@ -97,7 +108,7 @@ jobs:
 
       - name: Import Trivy Report to DefectDojo
         run: |
-          curl -i -f -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+          curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=Trivy Scan" \
             -F "test_title=Trivy SCA & Secrets" \
