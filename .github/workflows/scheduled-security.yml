@@ -48,12 +48,7 @@ jobs:
         run: |
           sleep 15
           API_URL="https://sonarcloud.io/api/issues/search?componentKeys=CapyTainh_node-goat&resolved=false&ps=500"
-          HTTP_CODE=$(curl -s -o sonar-raw.json -w "%{http_code}" -u "${{ secrets.SONAR_TOKEN }}:" "$API_URL")
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Token auth returned HTTP $HTTP_CODE, retrying via public SonarCloud API..."
-            HTTP_CODE=$(curl -s -o sonar-raw.json -w "%{http_code}" "$API_URL")
-          fi
+          HTTP_CODE=$(curl -s -o sonar-raw.json -w "%{http_code}" "$API_URL")
 
           if [ "$HTTP_CODE" != "200" ]; then
             echo "SonarCloud API failed with HTTP $HTTP_CODE:"
@@ -61,26 +56,32 @@ jobs:
             exit 1
           fi
 
-          python3 -c '
+          python3 - << 'EOF'
           import json
+
           sev_map = {"BLOCKER": "Critical", "CRITICAL": "High", "MAJOR": "Medium", "MINOR": "Low", "INFO": "Info"}
           raw = json.load(open("sonar-raw.json"))
           findings = []
+
           for i in raw.get("issues", []):
               comp = i.get("component", "")
               file_path = comp.split(":", 1)[1] if ":" in comp else comp
+              msg = i.get("message", "Issue")
+              rule = i.get("rule", "")
+              issue_type = i.get("type", "")
               findings.append({
-                  "title": f"[SonarQube] {i.get(\"message\", \"Issue\")[:200]}",
-                  "description": f"Rule: {i.get(\"rule\")}\nType: {i.get(\"type\")}\nMessage: {i.get(\"message\")}",
+                  "title": f"[SonarQube] {msg[:200]}",
+                  "description": f"Rule: {rule}\nType: {issue_type}\nMessage: {msg}",
                   "severity": sev_map.get(i.get("severity", "MAJOR"), "Medium"),
                   "file_path": file_path,
                   "line": i.get("line", 1),
                   "active": True,
                   "unique_id_from_tool": i.get("key")
               })
+
           json.dump({"findings": findings}, open("sonar-dojo.json", "w"))
           print(f"Prepared {len(findings)} SonarQube findings for DefectDojo")
-          '
+          EOF
 
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
