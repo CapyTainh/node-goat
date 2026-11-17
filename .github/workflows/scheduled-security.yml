@@ -16,7 +16,7 @@ jobs:
 
       # --- 1. SonarQube Cloud Scan ---
       - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v8.5.0
+        uses: SonarSource/sonarqube-scan-action@v8.4.1
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
@@ -46,7 +46,8 @@ jobs:
       # --- 4. Send All 3 Reports to DefectDojo ---
       - name: Export SonarCloud Issues & Import to DefectDojo
         run: |
-          curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+          sleep 15
+          curl -s -f -H "Authorization: Bearer ${{ secrets.SONAR_TOKEN }}" \
             "https://sonarcloud.io/api/issues/search?componentKeys=CapyTainh_node-goat&resolved=false&ps=500" \
             -o sonar-results.json
 
