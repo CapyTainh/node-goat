@@ -1,4 +1,4 @@
-name: Scheduled Security Scan (SonarQube & Trivy)
+name: Scheduled Security Scan (SonarQube, Semgrep, Trivy & DefectDojo)
 on:
   schedule:
     - cron: '0 0,8,16 * * *'
@@ -6,7 +6,7 @@ on:
 
 jobs:
   security-scan:
-    name: SonarQube & Trivy Scan
+    name: Full AppSec Suite & DefectDojo Sync
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Default Branch
@@ -14,6 +14,7 @@ jobs:
         with:
           fetch-depth: 0
 
+      # --- 1. SonarQube Cloud Scan ---
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v8.5.0
         env:
@@ -25,6 +26,13 @@ jobs:
             -Dsonar.sources=.
             -Dsonar.exclusions=**/node_modules/**,**/test/**
 
+      # --- 2. Semgrep Community Edition (Open-Source SAST) ---
+      - name: Semgrep CE SAST Scan
+        run: |
+          pip install semgrep
+          semgrep scan --config auto --json -o semgrep-results.json
+
+      # --- 3. Trivy (Dependency CVEs & Secrets) ---
       - name: Trivy Filesystem & Secret Scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -32,3 +40,49 @@ jobs:
           scan-ref: '.'
           scanners: 'vuln,secret'
           severity: 'CRITICAL,HIGH'
+          format: 'json'
+          output: 'trivy-results.json'
+
+      # --- 4. Send All 3 Reports to DefectDojo ---
+      - name: Export SonarCloud Issues & Import to DefectDojo
+        run: |
+          curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+            "https://sonarcloud.io/api/issues/search?componentKeys=CapyTainh_node-goat&resolved=false&ps=500" \
+            -o sonar-results.json
+
+          curl -i -f -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=SonarQube Scan" \
+            -F "test_title=SonarQube SAST" \
+            -F "file=@sonar-results.json" \
+            -F "product_name=node-goat" \
+            -F "product_type_name=GitHub Repositories" \
+            -F "engagement_name=Scheduled CI Scans" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"
+
+      - name: Import Semgrep Report to DefectDojo
+        run: |
+          curl -i -f -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=Semgrep JSON Report" \
+            -F "test_title=Semgrep CE SAST" \
+            -F "file=@semgrep-results.json" \
+            -F "product_name=node-goat" \
+            -F "product_type_name=GitHub Repositories" \
+            -F "engagement_name=Scheduled CI Scans" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"
+
+      - name: Import Trivy Report to DefectDojo
+        run: |
+          curl -i -f -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=Trivy Scan" \
+            -F "test_title=Trivy SCA & Secrets" \
+            -F "file=@trivy-results.json" \
+            -F "product_name=node-goat" \
+            -F "product_type_name=GitHub Repositories" \
+            -F "engagement_name=Scheduled CI Scans" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"
