@@ -1,4 +1,4 @@
-name: Scheduled Security Scan (CodeQL, Semgrep, Trivy & DefectDojo)
+name: Scheduled Security Scan (CodeQL, Semgrep, Trivy, Checkov, Scorecard & DefectDojo)
 on:
   pull_request:
   schedule:
@@ -7,17 +7,23 @@ on:
 
 jobs:
   security-scan:
-    name: Full AppSec Suite & DefectDojo Sync
+    name: Full AppSec, Container & Supply Chain Suite
     runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
       actions: read
+      id-token: write
+      issues: read
+      pull-requests: read
+      checks: read
     steps:
       - name: Checkout Branch
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      # --- 1. GitHub CodeQL (Uploads to GitHub Security/PRs & saves SARIF for DefectDojo) ---
+      # --- 1. GitHub CodeQL (Deep Semantic SAST) ---
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -29,7 +35,7 @@ jobs:
           upload: true
           output: sarif-results
 
-      # --- 2. Semgrep CE (Outputs JSON for DefectDojo & SARIF for GitHub Security/PRs in one pass) ---
+      # --- 2. Semgrep CE (Rule-based SAST -> JSON + SARIF) ---
       - name: Semgrep CE SAST Scan
         run: |
           pip install semgrep
@@ -41,8 +47,8 @@ jobs:
           sarif_file: semgrep-results.sarif
           category: semgrep
 
-      # --- 3. Trivy (Outputs JSON for DefectDojo & SARIF for GitHub Security/PRs) ---
-      - name: Trivy JSON Scan (for DefectDojo)
+      # --- 3. Trivy Filesystem (SCA, Secrets & CycloneDX SBOM Generation) ---
+      - name: Trivy Filesystem Scan (for DefectDojo)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: 'fs'
@@ -52,7 +58,7 @@ jobs:
           format: 'json'
           output: 'trivy-results.json'
 
-      - name: Trivy SARIF Scan (for GitHub Security)
+      - name: Trivy Filesystem SARIF (for GitHub Security)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: 'fs'
@@ -63,18 +69,110 @@ jobs:
           format: 'sarif'
           output: 'trivy-results.sarif'
 
-      - name: Upload Trivy SARIF to GitHub Security
+      - name: Upload Trivy Filesystem SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
-          category: trivy
+          category: trivy-fs
 
-      # --- 4. Import CodeQL SARIF into DefectDojo (Skipped on Pull Requests) ---
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'cyclonedx'
+          output: 'node-goat-sbom.cdx.json'
+
+      - name: Upload CycloneDX SBOM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-goat-cyclonedx-sbom
+          path: 'node-goat-sbom.cdx.json'
+          retention-days: 30
+
+      # --- 4. Container Image Scan (Runs automatically if a Dockerfile exists) ---
+      - name: Check for Dockerfile
+        id: check_docker
+        run: |
+          if [ -f "Dockerfile" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Local Container Image for Security Scan
+        if: steps.check_docker.outputs.exists == 'true'
+        continue-on-error: true
+        run: docker build -t local-scan:ci .
+
+      - name: Trivy Container Image Scan (for DefectDojo)
+        if: steps.check_docker.outputs.exists == 'true'
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'image'
+          image-ref: 'local-scan:ci'
+          severity: 'CRITICAL,HIGH'
+          format: 'json'
+          output: 'trivy-image-results.json'
+
+      - name: Trivy Container Image SARIF (for GitHub Security)
+        if: steps.check_docker.outputs.exists == 'true'
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'image'
+          image-ref: 'local-scan:ci'
+          severity: 'CRITICAL,HIGH'
+          limit-severities-for-sarif: true
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+
+      - name: Upload Trivy Container SARIF to GitHub Security
+        if: steps.check_docker.outputs.exists == 'true' && hashFiles('trivy-image-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-image
+
+      # --- 5. Checkov (Dockerfiles, Terraform, Pulumi IaC & GitHub Workflows) ---
+      - name: Checkov IaC, Dockerfile & CI/CD Scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+
+      - name: Upload Checkov SARIF to GitHub Security
+        if: hashFiles('checkov-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+      # --- 6. OpenSSF Scorecard (CI/CD Top 10 & Supply Chain Posture) ---
+      - name: OpenSSF Scorecard Analysis
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: ossf/scorecard-action@v2
+        with:
+          results_file: scorecard-results.sarif
+          results_format: sarif
+          publish_results: false
+
+      - name: Upload OpenSSF Scorecard SARIF to GitHub Security
+        if: github.event_name != 'pull_request' && hashFiles('scorecard-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard-results.sarif
+          category: scorecard
+
+      # --- 7. Sync All Results to DefectDojo (Skipped on Pull Requests) ---
       - name: Import CodeQL SARIF to DefectDojo
         if: github.event_name != 'pull_request'
         run: |
           SARIF_FILE=$(ls sarif-results/*.sarif | head -n 1)
-          echo "Uploading $SARIF_FILE to DefectDojo..."
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=SARIF" \
@@ -87,7 +185,6 @@ jobs:
             -F "auto_create_context=true" \
             -F "close_old_findings=true"
 
-      # --- 5. Import Semgrep Report into DefectDojo (Skipped on Pull Requests) ---
       - name: Import Semgrep Report to DefectDojo
         if: github.event_name != 'pull_request'
         run: |
@@ -103,8 +200,7 @@ jobs:
             -F "auto_create_context=true" \
             -F "close_old_findings=true"
 
-      # --- 6. Import Trivy Report into DefectDojo (Skipped on Pull Requests) ---
-      - name: Import Trivy Report to DefectDojo
+      - name: Import Trivy Filesystem Report to DefectDojo
         if: github.event_name != 'pull_request'
         run: |
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
@@ -113,6 +209,51 @@ jobs:
             -F "test_title=Trivy SCA & Secrets" \
             -F "tags=sca,secrets,trivy" \
             -F "file=@trivy-results.json" \
+            -F "product_name=node-goat" \
+            -F "product_type_name=GitHub Repositories" \
+            -F "engagement_name=Scheduled CI Scans" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"
+
+      - name: Import Trivy Container Image Report to DefectDojo
+        if: github.event_name != 'pull_request' && hashFiles('trivy-image-results.json') != ''
+        run: |
+          curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=Trivy Scan" \
+            -F "test_title=Trivy Container Image" \
+            -F "tags=container,trivy" \
+            -F "file=@trivy-image-results.json" \
+            -F "product_name=node-goat" \
+            -F "product_type_name=GitHub Repositories" \
+            -F "engagement_name=Scheduled CI Scans" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"
+
+      - name: Import Checkov IaC & CI/CD Report to DefectDojo
+        if: github.event_name != 'pull_request' && hashFiles('checkov-results.sarif') != ''
+        run: |
+          curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=SARIF" \
+            -F "test_title=Checkov IaC & CI/CD" \
+            -F "tags=iac,cicd,checkov" \
+            -F "file=@checkov-results.sarif" \
+            -F "product_name=node-goat" \
+            -F "product_type_name=GitHub Repositories" \
+            -F "engagement_name=Scheduled CI Scans" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"
+
+      - name: Import OpenSSF Scorecard Report to DefectDojo
+        if: github.event_name != 'pull_request' && hashFiles('scorecard-results.sarif') != ''
+        run: |
+          curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=SARIF" \
+            -F "test_title=OpenSSF Scorecard" \
+            -F "tags=cicd,scorecard,spvs" \
+            -F "file=@scorecard-results.sarif" \
             -F "product_name=node-goat" \
             -F "product_type_name=GitHub Repositories" \
             -F "engagement_name=Scheduled CI Scans" \
