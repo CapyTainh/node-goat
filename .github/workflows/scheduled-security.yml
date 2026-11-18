@@ -140,15 +140,15 @@ jobs:
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: .
-          output_format: sarif
-          output_file_path: checkov-results.sarif
+          output_format: sarif,json
+          output_file_path: checkov-reports
           soft_fail: true
 
       - name: Upload Checkov SARIF to GitHub Security
-        if: hashFiles('checkov-results.sarif') != ''
+        if: hashFiles('checkov-reports/results_sarif.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: checkov-results.sarif
+          sarif_file: checkov-reports/results_sarif.sarif
           category: checkov
 
       # --- 6. OpenSSF Scorecard (CI/CD Top 10 & Supply Chain Posture) ---
@@ -231,19 +231,23 @@ jobs:
             -F "close_old_findings=true"
 
       - name: Import Checkov IaC & CI/CD Report to DefectDojo
-        if: github.event_name != 'pull_request' && hashFiles('checkov-results.sarif') != ''
+        if: github.event_name != 'pull_request' && hashFiles('checkov-reports/results_json.json') != ''
         run: |
-          curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
-            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
-            -F "scan_type=SARIF" \
-            -F "test_title=Checkov IaC & CI/CD" \
-            -F "tags=iac,cicd,checkov" \
-            -F "file=@checkov-results.sarif" \
-            -F "product_name=node-goat" \
-            -F "product_type_name=GitHub Repositories" \
-            -F "engagement_name=Scheduled CI Scans" \
-            -F "auto_create_context=true" \
-            -F "close_old_findings=true"
+          if [ -s "checkov-reports/results_json.json" ]; then
+            curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+              -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+              -F "scan_type=Checkov Scan" \
+              -F "test_title=Checkov IaC & CI/CD" \
+              -F "tags=iac,cicd,checkov" \
+              -F "file=@checkov-reports/results_json.json" \
+              -F "product_name=node-goat" \
+              -F "product_type_name=GitHub Repositories" \
+              -F "engagement_name=Scheduled CI Scans" \
+              -F "auto_create_context=true" \
+              -F "close_old_findings=true"
+          else
+            echo "Checkov JSON report is empty; skipping upload."
+          fi
 
       - name: Import OpenSSF Scorecard Report to DefectDojo
         if: github.event_name != 'pull_request' && hashFiles('scorecard-results.sarif') != ''
