@@ -23,17 +23,17 @@ jobs:
         with:
           persist-credentials: false
 
-      # --- 1. Semgrep CE (SAST for languages outside CodeQL) ---
-      - name: Semgrep CE SAST Scan
-        run: |
-          pip install semgrep
-          semgrep scan --config auto --json-output=semgrep-results.json --sarif-output=semgrep-results.sarif
-
-      - name: Upload Semgrep SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+      # --- 1. GitHub CodeQL (Semantic SAST) ---
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
         with:
-          sarif_file: semgrep-results.sarif
-          category: semgrep
+          languages: javascript-typescript
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          upload: true
+          output: sarif-results
 
       # --- 2. Trivy Filesystem (SCA, Secrets & CycloneDX SBOM) ---
       - name: Trivy Filesystem Scan (for DefectDojo)
@@ -157,15 +157,16 @@ jobs:
           category: scorecard
 
       # --- 6. Sync All Results to DefectDojo (Skipped on Pull Requests) ---
-      - name: Import Semgrep Report to DefectDojo
+      - name: Import CodeQL SARIF to DefectDojo
         if: github.event_name != 'pull_request'
         run: |
+          SARIF_FILE=$(ls sarif-results/*.sarif | head -n 1)
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
-            -F "scan_type=Semgrep JSON Report" \
-            -F "test_title=Semgrep CE SAST" \
-            -F "tags=sast,semgrep" \
-            -F "file=@semgrep-results.json" \
+            -F "scan_type=SARIF" \
+            -F "test_title=CodeQL SAST" \
+            -F "tags=sast,codeql" \
+            -F "file=@$SARIF_FILE" \
             -F "product_name=node-goat" \
             -F "product_type_name=GitHub Repositories" \
             -F "engagement_name=Scheduled CI Scans" \
