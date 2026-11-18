@@ -1,4 +1,4 @@
-name: Scheduled Security Scan (CodeQL, Semgrep, Trivy, Checkov, Scorecard & DefectDojo)
+name: Scheduled Security Scan (SAST, Trivy, Checkov, Scorecard & DefectDojo)
 on:
   pull_request:
   schedule:
@@ -23,19 +23,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # --- 1. GitHub CodeQL (Deep Semantic SAST) ---
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: javascript-typescript
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          upload: true
-          output: sarif-results
-
-      # --- 2. Semgrep CE (Rule-based SAST -> JSON + SARIF) ---
+      # --- 1. Semgrep CE (SAST for languages outside CodeQL) ---
       - name: Semgrep CE SAST Scan
         run: |
           pip install semgrep
@@ -47,7 +35,7 @@ jobs:
           sarif_file: semgrep-results.sarif
           category: semgrep
 
-      # --- 3. Trivy Filesystem (SCA, Secrets & CycloneDX SBOM Generation) ---
+      # --- 2. Trivy Filesystem (SCA, Secrets & CycloneDX SBOM) ---
       - name: Trivy Filesystem Scan (for DefectDojo)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -90,7 +78,7 @@ jobs:
           path: 'node-goat-sbom.cdx.json'
           retention-days: 30
 
-      # --- 4. Container Image Scan (Runs automatically if a Dockerfile exists) ---
+      # --- 3. Container Image Scan (Runs automatically if a Dockerfile exists) ---
       - name: Check for Dockerfile
         id: check_docker
         run: |
@@ -135,7 +123,7 @@ jobs:
           sarif_file: trivy-image-results.sarif
           category: trivy-image
 
-      # --- 5. Checkov (Dockerfiles, Terraform, Pulumi IaC & GitHub Workflows) ---
+      # --- 4. Checkov (Dockerfiles, Terraform, Pulumi IaC & GitHub Workflows) ---
       - name: Checkov IaC, Dockerfile & CI/CD Scan
         uses: bridgecrewio/checkov-action@v12
         with:
@@ -151,7 +139,7 @@ jobs:
           sarif_file: checkov-reports/results_sarif.sarif
           category: checkov
 
-      # --- 6. OpenSSF Scorecard (CI/CD Top 10 & Supply Chain Posture) ---
+      # --- 5. OpenSSF Scorecard (CI/CD Top 10 & Supply Chain Posture) ---
       - name: OpenSSF Scorecard Analysis
         if: github.event_name != 'pull_request'
         continue-on-error: true
@@ -168,23 +156,7 @@ jobs:
           sarif_file: scorecard-results.sarif
           category: scorecard
 
-      # --- 7. Sync All Results to DefectDojo (Skipped on Pull Requests) ---
-      - name: Import CodeQL SARIF to DefectDojo
-        if: github.event_name != 'pull_request'
-        run: |
-          SARIF_FILE=$(ls sarif-results/*.sarif | head -n 1)
-          curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
-            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
-            -F "scan_type=SARIF" \
-            -F "test_title=CodeQL SAST" \
-            -F "tags=sast,codeql" \
-            -F "file=@$SARIF_FILE" \
-            -F "product_name=node-goat" \
-            -F "product_type_name=GitHub Repositories" \
-            -F "engagement_name=Scheduled CI Scans" \
-            -F "auto_create_context=true" \
-            -F "close_old_findings=true"
-
+      # --- 6. Sync All Results to DefectDojo (Skipped on Pull Requests) ---
       - name: Import Semgrep Report to DefectDojo
         if: github.event_name != 'pull_request'
         run: |
