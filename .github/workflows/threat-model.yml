@@ -20,7 +20,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Generate Visual STRIDE Threat Dragon Model from Repo & Scanner Evidence
+      - name: Generate or Enrich STRIDE Threat Dragon Model
         env:
           DD_URL: ${{ secrets.DEFECTDOJO_URL }}
           DD_TOKEN: ${{ secrets.DEFECTDOJO_TOKEN }}
@@ -35,15 +35,41 @@ jobs:
           dd_token = os.environ["DD_TOKEN"]
           repo_name = os.environ["REPO_NAME"]
 
-          # 1. Detect actual architectural components in this repository
-          has_dockerfile = os.path.exists("Dockerfile")
-          has_workflows = os.path.isdir(".github/workflows")
-          dep_manifests = [
-              f for f in ("package.json", "package-lock.json", "composer.json", "requirements.txt", "pom.xml", "go.mod")
-              if os.path.exists(f)
-          ]
+          # 1. Dynamically discover architectural signals in ANY repository
+          manifest_names = {
+              "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+              "requirements.txt", "pyproject.toml", "Pipfile.lock", "poetry.lock",
+              "pom.xml", "build.gradle", "build.gradle.kts", "go.mod", "Cargo.toml",
+              "composer.json", "composer.lock", "Gemfile", "Gemfile.lock"
+          }
+          db_indicators = ("prisma", "sequelize", "typeorm", "sqlalchemy", "hibernate", "mongoose", "knex", "migrations")
+          iac_extensions = (".tf", ".tfvars", ".bicep", ".helm")
 
-          # 2. Fetch ALL active findings (Critical, High, Medium, Low) for this repo from DefectDojo
+          detected_manifests = set()
+          has_db_layer = False
+          has_container_or_iac = False
+          has_cicd = False
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "venv", ".venv", "vendor", "dist", "build")]
+              rel_root = root.replace("\\", "/").lower()
+              if any(ind in rel_root for ind in db_indicators):
+                  has_db_layer = True
+              if ".github/workflows" in rel_root:
+                  has_cicd = True
+
+              for fname in files:
+                  fl = fname.lower()
+                  if fname in manifest_names or fl.endswith(".csproj"):
+                      detected_manifests.add(fname)
+                  if fl.endswith(".sql") or any(ind in fl for ind in db_indicators):
+                      has_db_layer = True
+                  if fl == "dockerfile" or fl.startswith("docker-compose") or fl.endswith(iac_extensions):
+                      has_container_or_iac = True
+                  if fl in ("jenkinsfile", ".gitlab-ci.yml", "azure-pipelines.yml"):
+                      has_cicd = True
+
+          # 2. Fetch ALL active findings across all layers for this repository from DefectDojo
           findings = []
           next_url = f"{dd_url}/api/v2/findings/?product_name={repo_name}&active=true&limit=250"
           while next_url:
@@ -60,27 +86,28 @@ jobs:
                   print(f"Warning: Could not fetch DefectDojo findings: {exc}")
                   break
 
-          # 3. Bucket findings by architectural component & STRIDE category
+          # 3. Map each finding to an architectural component & STRIDE category with full developer context
           component_threats = {
               "app-process": {},
               "dep-store": {},
-              "container-runtime": {},
+              "data-store": {},
+              "infra-runtime": {},
               "cicd-pipeline": {},
           }
 
           def classify_stride(cwe, title, svc):
               t = title.lower()
               if svc == "governance-posture":
-                  if "branch" in t or "review" in t or "audit" in t:
+                  if any(k in t for k in ("branch", "review", "audit", "signed", "history")):
                       return "Repudiation"
                   return "Tampering"
-              if cwe in (287, 798, 306, 522, 259, 321) or "secret" in t or "token" in t or "auth" in t or "jwt" in t:
+              if cwe in (287, 798, 306, 522, 259, 321, 345, 347) or any(k in t for k in ("secret", "token", "auth", "jwt", "credential", "password")):
                   return "Spoofing"
-              if cwe in (89, 79, 78, 94, 502, 1321, 918, 22, 352) or "injection" in t or "xss" in t or "pollution" in t:
+              if cwe in (89, 79, 78, 94, 502, 1321, 918, 22, 352, 434) or any(k in t for k in ("injection", "xss", "pollution", "traversal", "csrf", "deserialization")):
                   return "Tampering"
-              if cwe in (200, 312, 319, 359, 532, 327, 328) or "disclosure" in t or "entropy" in t or "md5" in t:
+              if cwe in (200, 312, 319, 359, 532, 327, 328, 209) or any(k in t for k in ("disclosure", "entropy", "md5", "sha1", "cleartext", "exposure", "leak")):
                   return "Information Disclosure"
-              if cwe in (400, 770, 787, 125, 416, 476) or "denial" in t or "dos" in t or "overflow" in t:
+              if cwe in (400, 770, 787, 125, 416, 476, 835) or any(k in t for k in ("denial", "dos", "overflow", "backtracking", "exhaustion")):
                   return "Denial of Service"
               return "Elevation of Privilege"
 
@@ -94,191 +121,288 @@ jobs:
                   continue
 
               cwe = f.get("cwe")
+              cve = f.get("cve")
               title = f.get("title", "Security Finding")
-              file_path = f.get("file_path") or f.get("component_name") or "repo"
-              stride_type = classify_stride(cwe, title, svc)
-              cwe_label = f"CWE-{cwe}" if cwe else "Config/Posture"
-              entry = f"[{sev}] {title} ({cwe_label} @ {file_path})"
+              file_path = f.get("file_path") or f.get("component_name") or "repository"
+              line_no = f.get("line")
+              loc = f"{file_path}:{line_no}" if line_no else file_path
 
+              id_parts = []
+              if cve:
+                  id_parts.append(cve)
+              if cwe:
+                  id_parts.append(f"CWE-{cwe}")
+              ref_tag = ", ".join(id_parts) if id_parts else svc
+
+              stride_type = classify_stride(cwe, title, svc)
+              entry = f"[{sev} | {svc}] {title} ({ref_tag}) -> Location: {loc}"
+
+              # Route finding to the right architectural component
               if svc == "code-layer":
-                  target_comp = "app-process"
+                  if cwe in (89, 943, 564) or any(k in title.lower() for k in ("sql", "nosql", "database", "query")):
+                      target_comp = "data-store"
+                      has_db_layer = True
+                  else:
+                      target_comp = "app-process"
               elif svc == "dependency-layer":
                   target_comp = "dep-store"
               elif svc == "container-layer":
-                  target_comp = "container-runtime"
+                  target_comp = "infra-runtime"
+                  has_container_or_iac = True
               elif svc == "iac-cicd-layer":
-                  target_comp = "container-runtime" if "dockerfile" in file_path.lower() else "cicd-pipeline"
+                  if any(k in file_path.lower() for k in ("dockerfile", "docker-compose", ".tf", "k8s", "helm")):
+                      target_comp = "infra-runtime"
+                      has_container_or_iac = True
+                  else:
+                      target_comp = "cicd-pipeline"
+                      has_cicd = True
               else:
                   target_comp = "cicd-pipeline"
+                  has_cicd = True
 
               bucket = component_threats[target_comp].setdefault(stride_type, [])
               if entry not in bucket:
                   bucket.append(entry)
 
-          # 4. Load developer threat-model.json if present, or build a repo-specific visual DFD (Threat Dragon v2)
-          if os.path.exists("threat-model.json"):
+          # Helper builders for Threat Dragon v2 (AntV X6) visual cells
+          def make_actor(cid, label, desc, x, y):
+              return {
+                  "id": cid,
+                  "shape": "actor",
+                  "position": {"x": x, "y": y},
+                  "size": {"width": 150, "height": 80},
+                  "attrs": {"text": {"text": label}},
+                  "data": {
+                      "type": "tm.Actor",
+                      "name": label,
+                      "description": desc,
+                      "outOfScope": False,
+                      "hasOpenThreats": False,
+                      "threats": []
+                  }
+              }
+
+          def make_process(cid, label, desc, x, y):
+              return {
+                  "id": cid,
+                  "shape": "process",
+                  "position": {"x": x, "y": y},
+                  "size": {"width": 170, "height": 90},
+                  "attrs": {"text": {"text": label}},
+                  "data": {
+                      "type": "tm.Process",
+                      "name": label,
+                      "description": desc,
+                      "outOfScope": False,
+                      "hasOpenThreats": False,
+                      "threats": []
+                  }
+              }
+
+          def make_store(cid, label, desc, x, y):
+              return {
+                  "id": cid,
+                  "shape": "store",
+                  "position": {"x": x, "y": y},
+                  "size": {"width": 180, "height": 80},
+                  "attrs": {"text": {"text": label}},
+                  "data": {
+                      "type": "tm.Store",
+                      "name": label,
+                      "description": desc,
+                      "outOfScope": False,
+                      "hasOpenThreats": False,
+                      "threats": []
+                  }
+              }
+
+          def make_flow(fid, label, src_id, dst_id, is_public=False, is_encrypted=True):
+              return {
+                  "id": fid,
+                  "shape": "flow",
+                  "source": {"cell": src_id},
+                  "target": {"cell": dst_id},
+                  "labels": [label],
+                  "data": {
+                      "type": "tm.Flow",
+                      "name": label,
+                      "protocol": "HTTPS" if is_encrypted else "Internal",
+                      "isEncrypted": is_encrypted,
+                      "isPublicNetwork": is_public,
+                      "hasOpenThreats": False,
+                      "threats": []
+                  }
+              }
+
+          # 4. Preserve developer threat-model.json if present, or generate a starter blueprint
+          is_custom_model = os.path.exists("threat-model.json")
+          if is_custom_model:
               with open("threat-model.json", "r", encoding="utf-8") as fh:
                   model = json.load(fh)
           else:
+              manifests_list = sorted(detected_manifests)
+              dep_label = f"Dependencies & Secrets\n({', '.join(manifests_list[:2]) if manifests_list else 'Packages'})"
+
               cells = [
                   {
                       "id": "trust-boundary-net",
-                      "type": "tm.Boundary",
-                      "position": {"x": 240, "y": 40},
-                      "size": {"width": 680, "height": 500},
+                      "shape": "trust-boundary-box",
+                      "position": {"x": 240, "y": 30},
+                      "size": {"width": 720, "height": 490},
+                      "attrs": {"text": {"text": f"{repo_name} Trusted Application & Runtime Boundary"}},
                       "data": {
+                          "type": "tm.Boundary",
                           "name": f"{repo_name} Trusted Application & Runtime Boundary",
-                          "description": "Separates untrusted external HTTP clients from internal application, dependency, and container layers."
+                          "description": "Auto-generated trust boundary. Developers can refine components and data flows in Threat Dragon."
                       }
                   },
-                  {
-                      "id": "external-actor",
-                      "type": "tm.Actor",
-                      "position": {"x": 40, "y": 140},
-                      "size": {"width": 140, "height": 80},
-                      "data": {
-                          "name": "External User / Attacker",
-                          "description": "Untrusted HTTP/API client interacting with the application surface",
-                          "outOfScope": False,
-                          "threats": []
-                      }
-                  },
-                  {
-                      "id": "app-process",
-                      "type": "tm.Process",
-                      "position": {"x": 300, "y": 140},
-                      "size": {"width": 180, "height": 90},
-                      "data": {
-                          "name": f"{repo_name} Web Application",
-                          "description": "Primary application source code & request handlers (code-layer)",
-                          "outOfScope": False,
-                          "threats": []
-                      }
-                  },
-                  {
-                      "id": "dep-store",
-                      "type": "tm.Store",
-                      "position": {"x": 620, "y": 140},
-                      "size": {"width": 190, "height": 90},
-                      "data": {
-                          "name": f"Dependencies & Secrets ({', '.join(dep_manifests) if dep_manifests else 'Libraries'})",
-                          "description": "Third-party packages, lockfiles, and credential stores (dependency-layer)",
-                          "outOfScope": False,
-                          "threats": []
-                      }
-                  },
-                  {
-                      "id": "flow-user-app",
-                      "type": "tm.Flow",
-                      "source": {"id": "external-actor"},
-                      "target": {"id": "app-process"},
-                      "data": {
-                          "name": "HTTP/HTTPS Requests",
-                          "protocol": "HTTPS",
-                          "isEncrypted": True,
-                          "isPublicNetwork": True,
-                          "threats": []
-                      }
-                  },
-                  {
-                      "id": "flow-app-deps",
-                      "type": "tm.Flow",
-                      "source": {"id": "app-process"},
-                      "target": {"id": "dep-store"},
-                      "data": {
-                          "name": "Library Calls & Secrets Access",
-                          "protocol": "Internal API",
-                          "isEncrypted": False,
-                          "isPublicNetwork": False,
-                          "threats": []
-                      }
-                  }
+                  make_actor(
+                      "external-actor",
+                      "External Client / User",
+                      "Untrusted external user or API consumer crossing the network boundary.",
+                      30, 140
+                  ),
+                  make_process(
+                      "app-process",
+                      f"{repo_name}\nApplication Service",
+                      "Core application code and request handlers (code-layer).",
+                      280, 135
+                  ),
+                  make_store(
+                      "dep-store",
+                      dep_label,
+                      "Third-party dependencies, lockfiles, and application secrets (dependency-layer).",
+                      540, 80
+                  ),
+                  make_flow("flow-client-app", "External Requests", "external-actor", "app-process", is_public=True, is_encrypted=True),
+                  make_flow("flow-app-deps", "Package & Secret Access", "app-process", "dep-store", is_public=False, is_encrypted=False),
               ]
 
-              if has_dockerfile:
-                  cells.append({
-                      "id": "container-runtime",
-                      "type": "tm.Process",
-                      "position": {"x": 300, "y": 360},
-                      "size": {"width": 190, "height": 90},
-                      "data": {
-                          "name": f"{repo_name} Docker Container Runtime",
-                          "description": "Container OS base packages and Dockerfile runtime privileges (container-layer)",
-                          "outOfScope": False,
-                          "threats": []
-                      }
-                  })
-                  cells.append({
-                      "id": "flow-app-container",
-                      "type": "tm.Flow",
-                      "source": {"id": "app-process"},
-                      "target": {"id": "container-runtime"},
-                      "data": {
-                          "name": "Executes Inside Container",
-                          "protocol": "OS Syscalls",
-                          "isEncrypted": False,
-                          "isPublicNetwork": False,
-                          "threats": []
-                      }
-                  })
+              if has_db_layer or component_threats["data-store"]:
+                  cells.append(make_store(
+                      "data-store",
+                      "Application Data Store",
+                      "Detected database schemas, ORM models, or data-access queries.",
+                      760, 190
+                  ))
+                  cells.append(make_flow(
+                      "flow-app-db", "Read / Write Queries", "app-process", "data-store", is_public=False, is_encrypted=False
+                  ))
 
-              if has_workflows:
-                  cells.append({
-                      "id": "cicd-pipeline",
-                      "type": "tm.Process",
-                      "position": {"x": 620, "y": 360},
-                      "size": {"width": 190, "height": 90},
-                      "data": {
-                          "name": "GitHub Actions CI/CD & Supply Chain",
-                          "description": "Build workflows, branch protection, and supply-chain governance (iac-cicd & governance-posture)",
-                          "outOfScope": False,
-                          "threats": []
-                      }
-                  })
+              if has_container_or_iac or component_threats["infra-runtime"]:
+                  cells.append(make_process(
+                      "infra-runtime",
+                      "Container & IaC Runtime",
+                      "Detected Dockerfiles, container images, or Infrastructure-as-Code definitions.",
+                      280, 360
+                  ))
+                  cells.append(make_flow(
+                      "flow-app-infra", "Runs On / Provisioned By", "app-process", "infra-runtime", is_public=False, is_encrypted=False
+                  ))
+
+              if has_cicd or component_threats["cicd-pipeline"]:
+                  cells.append(make_process(
+                      "cicd-pipeline",
+                      "CI/CD & Supply Chain",
+                      "Detected CI/CD workflows, repository governance, and build pipelines.",
+                      560, 360
+                  ))
+                  cells.append(make_flow(
+                      "flow-cicd-app", "Build & Release", "cicd-pipeline", "app-process", is_public=False, is_encrypted=True
+                  ))
 
               model = {
                   "version": "2.2.0",
                   "summary": {
-                      "title": f"{repo_name} Automated STRIDE Threat Model",
-                      "owner": "CapyTainh",
-                      "description": f"Component-mapped STRIDE threat model generated from live DefectDojo layers for {repo_name}."
+                      "title": f"{repo_name} STRIDE Threat Model (Evidence-Backed Blueprint)",
+                      "owner": "Security & Engineering",
+                      "description": (
+                          f"Starter threat model auto-generated for {repo_name} from repository structure and live scan evidence. "
+                          "Developers: open this file in OWASP Threat Dragon to refine architecture nodes, add custom data flows, "
+                          "and commit it as threat-model.json in the repository root."
+                      )
                   },
                   "detail": {
                       "contributors": [],
                       "diagrams": [{
                           "id": 0,
-                          "title": f"{repo_name} Architecture & Attack Surface (STRIDE)",
+                          "title": f"{repo_name} System Architecture & Attack Surface (STRIDE)",
                           "diagramType": "STRIDE",
                           "cells": cells
                       }]
                   }
               }
 
-          # 5. Populate STRIDE threats onto visual diagram AND build DefectDojo Generic Findings payload
+          # 5. Enrich diagram nodes (works on both auto-generated diagrams AND custom developer threat-model.json)
           dd_generic_findings = []
           diagrams = model.get("detail", {}).get("diagrams", [])
           if diagrams:
-              cells_by_id = {c.get("id"): c for c in diagrams[0].get("cells", [])}
-              fallback_cell = next(
-                  (c for c in diagrams[0].get("cells", []) if c.get("type") in ("tm.Process", "tm.Store")),
-                  None
-              )
+              diag0 = diagrams[0]
+              cells_list = diag0.get("cells") if "cells" in diag0 else diag0.get("diagramJson", {}).get("cells", [])
+              cells_by_id = {c.get("id"): c for c in cells_list}
+
+              def resolve_target_cell(comp_id):
+                  if comp_id in cells_by_id:
+                      return cells_by_id[comp_id]
+                  # Generic semantic matching for developer-drawn diagrams
+                  role_keywords = {
+                      "app-process": ("app", "server", "api", "service", "backend", "frontend", "web", "controller"),
+                      "dep-store": ("secret", "config", "vault", "file", "storage", "package", "lib", "cache"),
+                      "data-store": ("db", "database", "sql", "mongo", "postgres", "mysql", "redis", "store", "data"),
+                      "infra-runtime": ("container", "docker", "k8s", "kubernetes", "cloud", "aws", "azure", "vm", "infra", "runtime"),
+                      "cicd-pipeline": ("ci", "cd", "pipeline", "github", "gitlab", "jenkins", "build", "deploy", "auth", "oauth"),
+                  }.get(comp_id, ())
+                  for c in cells_list:
+                      ctype = c.get("shape") or c.get("type", "")
+                      if ctype not in ("process", "store", "tm.Process", "tm.Store"):
+                          continue
+                      label = (
+                          c.get("data", {}).get("name")
+                          or c.get("attrs", {}).get("text", {}).get("text")
+                          or ""
+                      ).lower()
+                      if any(k in label for k in role_keywords):
+                          return c
+                  return next(
+                      (c for c in cells_list if (c.get("shape") or c.get("type", "")) in ("process", "store", "tm.Process", "tm.Store")),
+                      None
+                  )
 
               for comp_id, stride_map in component_threats.items():
-                  target_cell = cells_by_id.get(comp_id) or fallback_cell
+                  target_cell = resolve_target_cell(comp_id)
                   if not target_cell:
                       continue
-                  threats = target_cell.setdefault("data", {}).setdefault("threats", [])
-                  existing_titles = {t.get("title") for t in threats}
+
+                  node_name = (
+                      target_cell.get("data", {}).get("name")
+                      or target_cell.get("attrs", {}).get("text", {}).get("text")
+                      or comp_id
+                  ).replace("\n", " ")
 
                   for stride_type, evidence_items in stride_map.items():
                       if not evidence_items:
                           continue
+
+                      if "data" in target_cell and isinstance(target_cell["data"], dict):
+                          target_cell["data"]["hasOpenThreats"] = True
+                          threats = target_cell["data"].setdefault("threats", [])
+                      else:
+                          target_cell["hasOpenThreats"] = True
+                          threats = target_cell.setdefault("threats", [])
+
+                      existing_titles = {t.get("title") for t in threats}
                       highest_sev = "Critical" if any(x.startswith("[Critical]") for x in evidence_items) else "High"
                       threat_id = f"{comp_id}-{stride_type.lower().replace(' ', '-')}"
-                      threat_title = f"[{comp_id}] {stride_type} Risk ({len(evidence_items)} correlated signals)"
-                      description_text = "Evidence collected across DefectDojo layers:\n- " + "\n- ".join(evidence_items[:12])
-                      mitigation_text = "Verify HTTP reachability in DAST/Pentest module and remediate underlying layer findings."
+                      threat_title = f"[{node_name}] {stride_type} Risk ({len(evidence_items)} scanner signals)"
+                      description_text = (
+                          "Pinpointed risks detected across active security layers:\n- "
+                          + "\n- ".join(evidence_items[:15])
+                      )
+                      mitigation_text = (
+                          "1. Inspect the pinpointed file paths/lines above.\n"
+                          "2. Validate exploitability via DAST/Pentest.\n"
+                          "3. Remediate underlying CWE/CVE findings and document architectural controls in Threat Dragon."
+                      )
 
                       if threat_title not in existing_titles:
                           threats.append({
@@ -296,8 +420,8 @@ jobs:
                           "description": description_text,
                           "severity": highest_sev,
                           "mitigation": mitigation_text,
-                          "impact": f"Architectural {stride_type} exposure on {comp_id} component.",
-                          "component_name": comp_id,
+                          "impact": f"Architectural {stride_type} exposure mapped to component '{node_name}'.",
+                          "component_name": node_name,
                           "unique_id_from_tool": threat_id,
                           "vuln_id_from_tool": f"STRIDE-{stride_type}",
                           "tags": ["threat-model", "stride", stride_type.lower().replace(" ", "-"), "nis2"]
@@ -310,7 +434,8 @@ jobs:
           with open("dd-threat-model-import.json", "w", encoding="utf-8") as dd_out:
               json.dump({"findings": dd_generic_findings}, dd_out, indent=2)
 
-          print(f"Generated {out_file} and {len(dd_generic_findings)} DefectDojo STRIDE findings.")
+          mode = "enriched developer threat-model.json" if is_custom_model else "generated starter blueprint"
+          print(f"Successfully {mode}: {out_file} ({len(dd_generic_findings)} STRIDE risk groups).")
           EOF
 
       - name: Upload Visual Threat Dragon Model Artifact
