@@ -156,7 +156,7 @@ jobs:
           sarif_file: scorecard-results.sarif
           category: scorecard
 
-      # --- 6. Sync All Results to DefectDojo (Skipped on Pull Requests) ---
+      # --- 6. Sync All Results to DefectDojo by Architectural Layer (Skipped on PRs) ---
       - name: Import CodeQL SARIF to DefectDojo
         if: github.event_name != 'pull_request'
         run: |
@@ -165,6 +165,7 @@ jobs:
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=SARIF" \
             -F "test_title=CodeQL SAST" \
+            -F "service=code-layer" \
             -F "tags=sast,codeql" \
             -F "file=@$SARIF_FILE" \
             -F "product_name=node-goat" \
@@ -180,6 +181,7 @@ jobs:
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=Trivy Scan" \
             -F "test_title=Trivy SCA & Secrets" \
+            -F "service=dependency-layer" \
             -F "tags=sca,secrets,trivy" \
             -F "file=@trivy-results.json" \
             -F "product_name=node-goat" \
@@ -195,6 +197,7 @@ jobs:
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=Trivy Scan" \
             -F "test_title=Trivy Container Image" \
+            -F "service=container-layer" \
             -F "tags=container,trivy" \
             -F "file=@trivy-image-results.json" \
             -F "product_name=node-goat" \
@@ -211,6 +214,7 @@ jobs:
               -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
               -F "scan_type=Checkov Scan" \
               -F "test_title=Checkov IaC & CI/CD" \
+              -F "service=iac-cicd-layer" \
               -F "tags=iac,cicd,checkov" \
               -F "file=@checkov-reports/results_json.json" \
               -F "product_name=node-goat" \
@@ -229,6 +233,7 @@ jobs:
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
             -F "scan_type=SARIF" \
             -F "test_title=OpenSSF Scorecard" \
+            -F "service=governance-posture" \
             -F "tags=cicd,scorecard,spvs" \
             -F "file=@scorecard-results.sarif" \
             -F "product_name=node-goat" \
