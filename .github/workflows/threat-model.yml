@@ -36,7 +36,7 @@ jobs:
           dd_token = os.environ["DD_TOKEN"]
           repo_name = os.environ["REPO_NAME"]
 
-          # 1. Detect any developer-created threat model files (Threat Dragon, Draw.io, Mermaid/MD, Miro/Paint)
+          # 1. Detect any developer-created threat model files
           supported_exts = (".json", ".drawio", ".md", ".png", ".jpg", ".jpeg", ".svg", ".pdf")
           developer_tm_files = []
 
@@ -53,7 +53,7 @@ jobs:
           developer_tm_files.sort()
           has_human_tm = len(developer_tm_files) > 0
 
-          # 2. Fetch active findings from DefectDojo across technical & governance layers
+          # 2. Fetch active findings from DefectDojo
           findings = []
           next_url = f"{dd_url}/api/v2/findings/?product_name={repo_name}&active=true&limit=250"
           while next_url:
@@ -70,25 +70,36 @@ jobs:
                   print(f"Warning: Could not fetch DefectDojo findings: {exc}")
                   break
 
-          # 3. Roll up raw findings into 6 Architectural Risk Themes + record DefectDojo evidence links
+          # 3. Architectural Risk Themes with Threat Scenario, Attack Path & Root-Cause Grouping
           risk_catalog = {
               "transit-session": {
                   "triggered": False,
                   "highest_sev": "Medium",
                   "signal_count": 0,
                   "layer_counts": {},
-                  "evidence_refs": [],
+                  "root_causes": {},
+                  "finding_links": [],
+                  "primary_cwe": None,
+                  "primary_file": None,
                   "target_id": "flow-client-app",
                   "target_name": "External Requests (Data Flow)",
                   "stride": "Information Disclosure",
                   "title": "Unencrypted or Forged Client Session Transit",
-                  "summary": (
-                      "External HTTP traffic crossing the public network boundary exhibits weak transport, "
-                      "cookie security, or cross-site request forgery exposure."
+                  "threat_scenario": (
+                      "Threat Actor: External Network Attacker / Man-in-the-Middle.\n"
+                      "Trust Boundary Crossed: Public Internet -> Application Entrypoint.\n"
+                      "Scenario: Session cookies or HTTP requests traverse the public boundary without enforced TLS "
+                      "transport flags or anti-CSRF validation, allowing session hijacking or forged state-changing actions."
+                  ),
+                  "attack_path": (
+                      "1. Attacker intercepts unencrypted HTTP traffic or lures an authenticated user to a malicious page.\n"
+                      "2. Because session cookies lack Secure/HttpOnly flags or endpoints lack CSRF tokens, the attacker "
+                      "replays or forges authenticated requests.\n"
+                      "3. Inspect underlying code-layer findings via the References links to harden cookie/middleware settings."
                   ),
                   "mitigation": (
-                      "Enforce HTTPS/TLS 1.2+ with HSTS headers, set Secure/HttpOnly/SameSite flags on all "
-                      "session cookies, and enforce anti-CSRF tokens on state-changing endpoints."
+                      "Enforce HTTPS/TLS 1.2+ with HSTS headers, set Secure/HttpOnly/SameSite=Strict on all "
+                      "session cookies, and enforce anti-CSRF tokens on state-changing routes."
                   ),
                   "doc_keywords": ("tls", "https", "ssl", "cookie", "csrf", "session", "transit", "encryption")
               },
@@ -97,18 +108,29 @@ jobs:
                   "highest_sev": "Medium",
                   "signal_count": 0,
                   "layer_counts": {},
-                  "evidence_refs": [],
+                  "root_causes": {},
+                  "finding_links": [],
+                  "primary_cwe": None,
+                  "primary_file": None,
                   "target_id": "app-process",
                   "target_name": f"{repo_name} Application Service",
                   "stride": "Tampering",
                   "title": "Untrusted Input & Execution Boundary Exposure",
-                  "summary": (
-                      "Application request handlers accept untrusted user input without strict validation or "
-                      "sandboxing, creating command injection, XSS, SSRF, or resource exhaustion paths."
+                  "threat_scenario": (
+                      "Threat Actor: Unauthenticated or Authenticated External User.\n"
+                      "Trust Boundary Crossed: External Client -> Application Request Handlers.\n"
+                      "Scenario: User-controlled HTTP input reaches dangerous sinks (dynamic code execution, outbound URL "
+                      "fetchers, HTML templates, or backtracking regexes) without strict schema validation."
+                  ),
+                  "attack_path": (
+                      "1. Attacker sends crafted payloads in HTTP query parameters, JSON bodies, or form fields.\n"
+                      "2. Application handlers pass the untrusted input directly into execution, SSRF, or regex sinks.\n"
+                      "3. Depending on the sink, this enables arbitrary code execution, internal network probing (SSRF), "
+                      "stored/reflected XSS, or CPU exhaustion (ReDoS)."
                   ),
                   "mitigation": (
-                      "Enforce schema-based input validation at API boundaries, context-aware output encoding, "
-                      "SSRF allowlists, and strict regex/payload timeouts."
+                      "Enforce strict schema validation at API boundaries, context-aware output encoding, "
+                      "outbound domain allowlists for SSRF protection, and safe linear-time regular expressions."
                   ),
                   "doc_keywords": ("input", "validation", "xss", "ssrf", "injection", "execution", "sanitiz", "tampering")
               },
@@ -117,18 +139,28 @@ jobs:
                   "highest_sev": "Medium",
                   "signal_count": 0,
                   "layer_counts": {},
-                  "evidence_refs": [],
+                  "root_causes": {},
+                  "finding_links": [],
+                  "primary_cwe": None,
+                  "primary_file": None,
                   "target_id": "data-store",
                   "target_name": "Application Data Store",
                   "stride": "Elevation of Privilege",
                   "title": "Unparameterized Data Store Query Manipulation",
-                  "summary": (
-                      "Database or document queries construct commands dynamically from external parameters, "
-                      "risking unauthorized data access or privilege escalation."
+                  "threat_scenario": (
+                      "Threat Actor: External Application User.\n"
+                      "Trust Boundary Crossed: Application Service -> Persistent Database / NoSQL Store.\n"
+                      "Scenario: Database or document queries incorporate raw user-supplied values directly into query "
+                      "objects or SQL strings, allowing an attacker to alter query logic and bypass authorization."
+                  ),
+                  "attack_path": (
+                      "1. Attacker submits operator-injected JSON objects (NoSQL) or SQL metacharacters via API inputs.\n"
+                      "2. The data-access layer executes the manipulated query with the application's database privileges.\n"
+                      "3. Attacker extracts sensitive records, modifies data, or escalates to administrative privileges."
                   ),
                   "mitigation": (
-                      "Replace dynamic query concatenation with parameterized queries/prepared statements, "
-                      "enforce ORM type binding, and restrict database user roles to least privilege."
+                      "Replace dynamic query construction with parameterized queries/prepared statements, "
+                      "enforce strict primitive type casting before querying, and restrict DB credentials to least privilege."
                   ),
                   "doc_keywords": ("sql", "nosql", "database", "query", "parameterized", "store", "db", "persistence")
               },
@@ -137,18 +169,29 @@ jobs:
                   "highest_sev": "Medium",
                   "signal_count": 0,
                   "layer_counts": {},
-                  "evidence_refs": [],
+                  "root_causes": {},
+                  "finding_links": [],
+                  "primary_cwe": None,
+                  "primary_file": None,
                   "target_id": "dep-store",
                   "target_name": "Dependencies & Secrets Store",
                   "stride": "Spoofing",
                   "title": "Exposed Credentials & Vulnerable Third-Party Components",
-                  "summary": (
-                      "Hardcoded secrets, weak authentication controls, or outdated third-party packages "
-                      "expose application identity and transitive supply-chain surfaces."
+                  "threat_scenario": (
+                      "Threat Actor: External Attacker / Repository Consumer.\n"
+                      "Trust Boundary Crossed: Identity & Third-Party Supply Chain -> Application Core.\n"
+                      "Scenario: Hardcoded private keys/credentials in the repository or known high-severity CVEs in "
+                      "third-party packages allow attackers to impersonate services or exploit vulnerable library functions."
+                  ),
+                  "attack_path": (
+                      "1. Attacker extracts hardcoded keys/certificates from source/artifacts or targets known CVEs in "
+                      "exposed dependency parsers (e.g., body-parser, minimist, bson).\n"
+                      "2. Exposed cryptographic keys enable TLS/token spoofing, while vulnerable packages allow prototype "
+                      "pollution or remote code execution inside the app process."
                   ),
                   "mitigation": (
-                      "Rotate exposed keys, move all secrets into a dedicated secrets manager/vault, enforce "
-                      "rate-limiting/MFA on auth routes, and upgrade vulnerable packages via SBOM tracking."
+                      "Revoke and rotate exposed keys immediately, move secrets to an external vault/environment store, "
+                      "and upgrade vulnerable third-party dependencies tracked in the CycloneDX SBOM."
                   ),
                   "doc_keywords": ("secret", "key", "token", "vault", "credential", "dependency", "package", "spoofing", "auth")
               },
@@ -157,18 +200,28 @@ jobs:
                   "highest_sev": "Medium",
                   "signal_count": 0,
                   "layer_counts": {},
-                  "evidence_refs": [],
+                  "root_causes": {},
+                  "finding_links": [],
+                  "primary_cwe": None,
+                  "primary_file": None,
                   "target_id": "infra-runtime",
                   "target_name": "Container & IaC Runtime",
                   "stride": "Elevation of Privilege",
                   "title": "Privileged Runtime & Unpatched Base Image Surface",
-                  "summary": (
-                      "Container runtime configurations or underlying OS packages introduce privilege escalation "
-                      "and denial-of-service exposure inside the deployment environment."
+                  "threat_scenario": (
+                      "Threat Actor: Attacker with Initial App Foothold.\n"
+                      "Trust Boundary Crossed: Application Process -> Container OS & Host Infrastructure.\n"
+                      "Scenario: Outdated OS base packages (OpenSSL, zlib, curl, Apache) or privileged container runtime "
+                      "settings expand the blast radius if an application-layer flaw is exploited."
+                  ),
+                  "attack_path": (
+                      "1. Attacker compromises an application endpoint or exploits an exposed network daemon.\n"
+                      "2. Vulnerable OS libraries or root container permissions allow privilege escalation, local file "
+                      "tampering, or service crashes inside the container."
                   ),
                   "mitigation": (
-                      "Migrate to minimal/distroless base images, drop root privileges (USER nonroot), "
-                      "enable read-only root filesystems, and automate base image rebuilds."
+                      "Rebuild on minimal/distroless base images, enforce a non-root container user (USER nonroot), "
+                      "mount the root filesystem read-only, and schedule automated image rebuilds."
                   ),
                   "doc_keywords": ("container", "docker", "root", "image", "runtime", "kubernetes", "iac", "base image")
               },
@@ -177,18 +230,28 @@ jobs:
                   "highest_sev": "Medium",
                   "signal_count": 0,
                   "layer_counts": {},
-                  "evidence_refs": [],
+                  "root_causes": {},
+                  "finding_links": [],
+                  "primary_cwe": None,
+                  "primary_file": None,
                   "target_id": "cicd-pipeline",
                   "target_name": "CI/CD & Supply Chain",
                   "stride": "Repudiation",
                   "title": "Unprotected Release Branches & Mutable Build Steps",
-                  "summary": (
-                      "Missing branch protection, overly broad workflow permissions, or unpinned third-party "
-                      "actions weaken build integrity and auditability."
+                  "threat_scenario": (
+                      "Threat Actor: Compromised Maintainer Account / Malicious Upstream Dependency.\n"
+                      "Trust Boundary Crossed: Source Control & CI/CD Pipeline -> Production Artifacts.\n"
+                      "Scenario: Missing branch protection on the default branch, overly permissive workflow tokens, or "
+                      "unpinned GitHub Actions allow unauthorized code merges or build pipeline tampering."
+                  ),
+                  "attack_path": (
+                      "1. Direct pushes to the default branch bypass peer code review and security checks.\n"
+                      "2. Workflows without explicit read-only top-level permissions or SHA-pinned actions can leak CI "
+                      "secrets or execute modified third-party action tags."
                   ),
                   "mitigation": (
-                      "Enable branch protection with required PR reviews, pin GitHub Actions by full commit SHA, "
-                      "and scope GITHUB_TOKEN permissions to minimum read-only defaults."
+                      "Enable branch protection with required PR reviews on the default branch, pin all GitHub Actions "
+                      "to full commit SHAs, and set top-level workflow permissions to 'contents: read'."
                   ),
                   "doc_keywords": ("ci/cd", "pipeline", "branch", "workflow", "pin", "github actions", "supply chain", "repudiation")
               },
@@ -201,21 +264,30 @@ jobs:
               sev = finding_obj.get("severity", "Medium")
               svc = finding_obj.get("service") or "code-layer"
               fid = finding_obj.get("id")
-              ftitle = finding_obj.get("title", "Finding")
+              ftitle = (finding_obj.get("title") or "Finding").split(":")[0].strip()
               cwe = finding_obj.get("cwe")
               fpath = finding_obj.get("file_path") or finding_obj.get("component_name") or ""
 
               item["triggered"] = True
               item["signal_count"] += 1
               item["layer_counts"][svc] = item["layer_counts"].get(svc, 0) + 1
-              if sev_rank.get(sev, 0) > sev_rank.get(item["highest_sev"], 0):
-                  item["highest_sev"] = sev
 
-              cwe_str = f" | CWE-{cwe}" if cwe else ""
-              loc_str = f" @ {fpath}" if fpath else ""
-              link_str = f" -> http://localhost:8080/finding/{fid}" if fid else ""
-              ref_line = f"- [{sev} | {svc}{cwe_str}] {ftitle}{loc_str}{link_str}"
-              item["evidence_refs"].append((sev_rank.get(sev, 0), ref_line))
+              if sev_rank.get(sev, 0) >= sev_rank.get(item["highest_sev"], 0):
+                  item["highest_sev"] = sev
+                  if cwe:
+                      item["primary_cwe"] = cwe
+                  if fpath and "no file" not in fpath.lower():
+                      item["primary_file"] = fpath
+
+              # Group identical rule titles so DefectDojo shows distinct root causes + counts
+              rc_key = f"[{sev} | {svc}] {ftitle}"
+              rc_entry = item["root_causes"].setdefault(rc_key, {"count": 0, "locations": set(), "sample_id": fid})
+              rc_entry["count"] += 1
+              if fpath and "no file" not in fpath.lower() and len(rc_entry["locations"]) < 3:
+                  rc_entry["locations"].add(fpath)
+
+              if fid and len(item["finding_links"]) < 10:
+                  item["finding_links"].append((sev_rank.get(sev, 0), f"http://localhost:8080/finding/{fid} ({ftitle})"))
 
           for f in findings:
               svc = f.get("service") or "code-layer"
@@ -250,17 +322,41 @@ jobs:
                   else:
                       mark_theme("app-input-logic", f)
 
-          def build_traceability_block(item):
-              layers_summary = ", ".join(f"{k} ({v})" for k, v in sorted(item["layer_counts"].items()))
-              sorted_refs = [r[1] for r in sorted(item["evidence_refs"], key=lambda x: -x[0])[:8]]
-              filter_layers = " or ".join(sorted(item["layer_counts"].keys()))
-              return (
-                  f"**Correlated DefectDojo Layers:** {layers_summary}\n"
-                  f"**How to Filter All {item['signal_count']} Signals in DefectDojo:** "
-                  f"Go to Findings -> Filter by Asset = `{repo_name}` and Service = `{filter_layers}`\n\n"
-                  f"**Top Triggering Findings (Direct Local Links):**\n"
-                  + "\n".join(sorted_refs)
+          def format_dd_card(item, prefix_label):
+              layers_str = ", ".join(f"{k}: {v}" for k, v in sorted(item["layer_counts"].items()))
+              root_cause_lines = []
+              for rc_label, info in sorted(item["root_causes"].items(), key=lambda x: -x[1]["count"])[:8]:
+                  locs = f" -> Examples: {', '.join(sorted(info['locations']))}" if info["locations"] else ""
+                  count_tag = f" ({info['count']} occurrences)" if info["count"] > 1 else ""
+                  root_cause_lines.append(f"- {rc_label}{count_tag}{locs}")
+
+              refs_text = "\n".join(r[1] for r in sorted(item["finding_links"], key=lambda x: -x[0]))
+              primary_loc_note = f" (Primary: {item['primary_file']})" if item["primary_file"] else ""
+
+              description = (
+                  f"{item['threat_scenario']}\n\n"
+                  f"**Correlated Layers ({item['signal_count']} total signals):** {layers_str}\n\n"
+                  f"**Distinct Root Causes Identified:**\n" + "\n".join(root_cause_lines)
               )
+
+              card = {
+                  "title": f"[{prefix_label} | STRIDE: {item['stride']}] {item['title']}{primary_loc_note}",
+                  "description": description,
+                  "steps_to_reproduce": item["attack_path"],
+                  "references": refs_text,
+                  "severity": item["highest_sev"],
+                  "mitigation": item["mitigation"],
+                  "impact": f"Architectural {item['stride']} exposure on {item['target_name']} ({item['signal_count']} underlying signals).",
+                  "component_name": item["target_name"],
+                  "unique_id_from_tool": f"{prefix_label.lower().replace(' ', '-')}-{item['target_id']}-{item['stride'].lower().replace(' ', '-')}",
+                  "vuln_id_from_tool": f"STRIDE-{item['stride']}",
+                  "tags": ["threat-model", prefix_label.lower().replace(" ", "-"), "stride", item["stride"].lower().replace(" ", "-"), "nis2"]
+              }
+              if item["primary_cwe"]:
+                  card["cwe"] = item["primary_cwe"]
+              if item["primary_file"]:
+                  card["file_path"] = item["primary_file"]
+              return card
 
           dd_findings = []
 
@@ -304,6 +400,7 @@ jobs:
                   "mitigation": "Keep threat model updated when adding new services, external integrations, or trust boundaries.",
                   "impact": "Satisfies continuous architectural risk analysis governance (NIS2).",
                   "component_name": "Architecture & Design",
+                  "file_path": developer_tm_files[0],
                   "unique_id_from_tool": f"{repo_name}-human-tm-verified",
                   "vuln_id_from_tool": "NIS2-RISK-ANALYSIS",
                   "tags": ["threat-model", "human-authored", "nis2-compliant"]
@@ -314,24 +411,7 @@ jobs:
                       if not item["triggered"]:
                           continue
                       if not any(kw in corpus for kw in item["doc_keywords"]):
-                          trace_block = build_traceability_block(item)
-                          dd_findings.append({
-                              "title": f"[Threat Model Gap] Unaddressed {item['stride']} Risk: {item['title']}",
-                              "description": (
-                                  f"Scanner evidence ({item['signal_count']} signals) indicates architectural exposure "
-                                  f"on {item['target_name']}, which is not yet documented in {files_str}.\n\n"
-                                  f"**Architectural Risk:** {item['summary']}\n\n"
-                                  f"{trace_block}"
-                              ),
-                              "steps_to_reproduce": trace_block,
-                              "severity": item["highest_sev"],
-                              "mitigation": item["mitigation"],
-                              "impact": f"Potential {item['stride']} gap between documented architecture and implementation.",
-                              "component_name": item["target_name"],
-                              "unique_id_from_tool": f"tm-gap-{key}",
-                              "vuln_id_from_tool": f"STRIDE-{item['stride']}",
-                              "tags": ["threat-model", "threat-model-gap", "stride", item["stride"].lower().replace(" ", "-"), "nis2"]
-                          })
+                          dd_findings.append(format_dd_card(item, "Threat Model Gap"))
 
           # =====================================================================
           # MODE A: No Human Threat Model Yet -> Generate Clean Starter Blueprint
@@ -427,28 +507,11 @@ jobs:
                       "status": "Open",
                       "severity": item["highest_sev"],
                       "type": item["stride"],
-                      "description": f"{item['summary']} (Correlated from {item['signal_count']} scanner signals; see DefectDojo for file-level details.)",
+                      "description": item["threat_scenario"],
                       "mitigation": item["mitigation"]
                   })
 
-                  trace_block = build_traceability_block(item)
-                  dd_findings.append({
-                      "title": f"[Starter Blueprint] {item['title']}",
-                      "description": (
-                          f"{item['summary']}\n\n"
-                          f"{trace_block}\n\n"
-                          "Note: Auto-generated architectural baseline. Developers can customize this model by committing "
-                          "threat-model.json or files under threat-model/."
-                      ),
-                      "steps_to_reproduce": trace_block,
-                      "severity": item["highest_sev"],
-                      "mitigation": item["mitigation"],
-                      "impact": f"Architectural {item['stride']} risk on {item['target_name']}.",
-                      "component_name": item["target_name"],
-                      "unique_id_from_tool": f"blueprint-{key}",
-                      "vuln_id_from_tool": f"STRIDE-{item['stride']}",
-                      "tags": ["threat-model", "starter-blueprint", "stride", item["stride"].lower().replace(" ", "-"), "nis2"]
-                  })
+                  dd_findings.append(format_dd_card(item, "Starter Blueprint"))
 
               model = {
                   "version": "2.2.0",
@@ -479,7 +542,7 @@ jobs:
 
           with open("dd-threat-model-import.json", "w", encoding="utf-8") as dd_out:
               json.dump({"findings": dd_findings}, dd_out, indent=2)
-          print(f"Prepared {len(dd_findings)} clean architectural entries for DefectDojo.")
+          print(f"Prepared {len(dd_findings)} structured threat cards for DefectDojo.")
           EOF
 
       - name: Upload Starter Threat Dragon Blueprint Artifact (When No Human Model Exists)
