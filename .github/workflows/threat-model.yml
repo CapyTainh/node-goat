@@ -115,7 +115,7 @@ jobs:
               if entry not in bucket:
                   bucket.append(entry)
 
-          # 4. Load developer threat-model.json if present, or build a repo-specific visual DFD
+          # 4. Load developer threat-model.json if present, or build a repo-specific visual DFD (Threat Dragon v2)
           if os.path.exists("threat-model.json"):
               with open("threat-model.json", "r", encoding="utf-8") as fh:
                   model = json.load(fh)
@@ -254,7 +254,8 @@ jobs:
                   }
               }
 
-          # 5. Populate STRIDE threats onto each matching visual component
+          # 5. Populate STRIDE threats onto visual diagram AND build DefectDojo Generic Findings payload
+          dd_generic_findings = []
           diagrams = model.get("detail", {}).get("diagrams", [])
           if diagrams:
               cells_by_id = {c.get("id"): c for c in diagrams[0].get("cells", [])}
@@ -274,22 +275,42 @@ jobs:
                       if not evidence_items:
                           continue
                       highest_sev = "Critical" if any(x.startswith("[Critical]") for x in evidence_items) else "High"
+                      threat_id = f"{comp_id}-{stride_type.lower().replace(' ', '-')}"
                       threat_title = f"[{comp_id}] {stride_type} Risk ({len(evidence_items)} correlated signals)"
+                      description_text = "Evidence collected across DefectDojo layers:\n- " + "\n- ".join(evidence_items[:12])
+                      mitigation_text = "Verify HTTP reachability in DAST/Pentest module and remediate underlying layer findings."
+
                       if threat_title not in existing_titles:
                           threats.append({
-                              "id": f"{comp_id}-{stride_type.lower().replace(' ', '-')}",
+                              "id": threat_id,
                               "title": threat_title,
                               "status": "Open",
                               "severity": highest_sev,
                               "type": stride_type,
-                              "description": "Evidence collected across DefectDojo layers:\n- " + "\n- ".join(evidence_items[:12]),
-                              "mitigation": "Verify HTTP reachability in DAST/Pentest module and remediate underlying layer findings."
+                              "description": description_text,
+                              "mitigation": mitigation_text
                           })
+
+                      dd_generic_findings.append({
+                          "title": threat_title,
+                          "description": description_text,
+                          "severity": highest_sev,
+                          "mitigation": mitigation_text,
+                          "impact": f"Architectural {stride_type} exposure on {comp_id} component.",
+                          "component_name": comp_id,
+                          "unique_id_from_tool": threat_id,
+                          "vuln_id_from_tool": f"STRIDE-{stride_type}",
+                          "tags": ["threat-model", "stride", stride_type.lower().replace(" ", "-"), "nis2"]
+                      })
 
           out_file = f"{repo_name}-threat-model.json"
           with open(out_file, "w", encoding="utf-8") as out:
               json.dump(model, out, indent=2)
-          print(f"Generated visual Threat Dragon model: {out_file}")
+
+          with open("dd-threat-model-import.json", "w", encoding="utf-8") as dd_out:
+              json.dump({"findings": dd_generic_findings}, dd_out, indent=2)
+
+          print(f"Generated {out_file} and {len(dd_generic_findings)} DefectDojo STRIDE findings.")
           EOF
 
       - name: Upload Visual Threat Dragon Model Artifact
@@ -300,16 +321,16 @@ jobs:
           path: 'node-goat-threat-model.json'
           retention-days: 30
 
-      - name: Import Threat Dragon Model to DefectDojo
-        if: hashFiles('node-goat-threat-model.json') != ''
+      - name: Import STRIDE Threat Model Risks to DefectDojo
+        if: hashFiles('dd-threat-model-import.json') != ''
         run: |
           curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
-            -F "scan_type=Threat Dragon" \
+            -F "scan_type=Generic Findings Import" \
             -F "test_title=OWASP Threat Dragon" \
             -F "service=threat-model-layer" \
             -F "tags=threat-model,stride,nis2" \
-            -F "file=@node-goat-threat-model.json" \
+            -F "file=@dd-threat-model-import.json" \
             -F "product_name=node-goat" \
             -F "product_type_name=GitHub Repositories" \
             -F "engagement_name=Scheduled CI Scans" \
