@@ -36,7 +36,7 @@ jobs:
           dd_token = os.environ["DD_TOKEN"]
           repo_name = os.environ["REPO_NAME"]
 
-          # 1. Detect any developer-created threat model files (Threat Dragon, Draw.io, Mermaid/MD, Miro/Paint images/PDF)
+          # 1. Detect any developer-created threat model files (Threat Dragon, Draw.io, Mermaid/MD, Miro/Paint)
           supported_exts = (".json", ".drawio", ".md", ".png", ".jpg", ".jpeg", ".svg", ".pdf")
           developer_tm_files = []
 
@@ -70,12 +70,14 @@ jobs:
                   print(f"Warning: Could not fetch DefectDojo findings: {exc}")
                   break
 
-          # 3. Roll up raw findings into 5 high-level Architectural Risk Themes (1-to-1 rollup, no CVE spam)
+          # 3. Roll up raw findings into 6 Architectural Risk Themes + record DefectDojo evidence links
           risk_catalog = {
               "transit-session": {
                   "triggered": False,
                   "highest_sev": "Medium",
                   "signal_count": 0,
+                  "layer_counts": {},
+                  "evidence_refs": [],
                   "target_id": "flow-client-app",
                   "target_name": "External Requests (Data Flow)",
                   "stride": "Information Disclosure",
@@ -94,6 +96,8 @@ jobs:
                   "triggered": False,
                   "highest_sev": "Medium",
                   "signal_count": 0,
+                  "layer_counts": {},
+                  "evidence_refs": [],
                   "target_id": "app-process",
                   "target_name": f"{repo_name} Application Service",
                   "stride": "Tampering",
@@ -112,6 +116,8 @@ jobs:
                   "triggered": False,
                   "highest_sev": "Medium",
                   "signal_count": 0,
+                  "layer_counts": {},
+                  "evidence_refs": [],
                   "target_id": "data-store",
                   "target_name": "Application Data Store",
                   "stride": "Elevation of Privilege",
@@ -130,6 +136,8 @@ jobs:
                   "triggered": False,
                   "highest_sev": "Medium",
                   "signal_count": 0,
+                  "layer_counts": {},
+                  "evidence_refs": [],
                   "target_id": "dep-store",
                   "target_name": "Dependencies & Secrets Store",
                   "stride": "Spoofing",
@@ -148,6 +156,8 @@ jobs:
                   "triggered": False,
                   "highest_sev": "Medium",
                   "signal_count": 0,
+                  "layer_counts": {},
+                  "evidence_refs": [],
                   "target_id": "infra-runtime",
                   "target_name": "Container & IaC Runtime",
                   "stride": "Elevation of Privilege",
@@ -166,6 +176,8 @@ jobs:
                   "triggered": False,
                   "highest_sev": "Medium",
                   "signal_count": 0,
+                  "layer_counts": {},
+                  "evidence_refs": [],
                   "target_id": "cicd-pipeline",
                   "target_name": "CI/CD & Supply Chain",
                   "stride": "Repudiation",
@@ -184,16 +196,30 @@ jobs:
 
           sev_rank = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Info": 0}
 
-          def mark_theme(theme_key, sev):
+          def mark_theme(theme_key, finding_obj):
               item = risk_catalog[theme_key]
+              sev = finding_obj.get("severity", "Medium")
+              svc = finding_obj.get("service") or "code-layer"
+              fid = finding_obj.get("id")
+              ftitle = finding_obj.get("title", "Finding")
+              cwe = finding_obj.get("cwe")
+              fpath = finding_obj.get("file_path") or finding_obj.get("component_name") or ""
+
               item["triggered"] = True
               item["signal_count"] += 1
+              item["layer_counts"][svc] = item["layer_counts"].get(svc, 0) + 1
               if sev_rank.get(sev, 0) > sev_rank.get(item["highest_sev"], 0):
                   item["highest_sev"] = sev
 
+              cwe_str = f" | CWE-{cwe}" if cwe else ""
+              loc_str = f" @ {fpath}" if fpath else ""
+              link_str = f" -> http://localhost:8080/finding/{fid}" if fid else ""
+              ref_line = f"- [{sev} | {svc}{cwe_str}] {ftitle}{loc_str}{link_str}"
+              item["evidence_refs"].append((sev_rank.get(sev, 0), ref_line))
+
           for f in findings:
               svc = f.get("service") or "code-layer"
-              if svc == "threat-model-layer":
+              if svc in ("threat-model-layer", "runtime-layer", "pentest-layer"):
                   continue
               sev = f.get("severity", "Medium")
               if sev == "Info":
@@ -204,26 +230,37 @@ jobs:
               file_path = (f.get("file_path") or "").lower()
 
               if svc == "governance-posture":
-                  mark_theme("cicd-governance", sev)
+                  mark_theme("cicd-governance", f)
               elif svc == "iac-cicd-layer":
                   if any(k in file_path for k in ("dockerfile", "docker-compose", ".tf", "k8s", "helm")):
-                      mark_theme("container-infra", sev)
+                      mark_theme("container-infra", f)
                   else:
-                      mark_theme("cicd-governance", sev)
+                      mark_theme("cicd-governance", f)
               elif svc == "container-layer":
-                  mark_theme("container-infra", sev)
+                  mark_theme("container-infra", f)
               elif svc == "dependency-layer":
-                  mark_theme("secrets-supply-deps", sev)
+                  mark_theme("secrets-supply-deps", f)
               else:
-                  # code-layer architectural classification
                   if cwe in (319, 352, 614, 1275, 295) or any(k in title for k in ("cookie", "csrf", "tls", "ssl", "cors")):
-                      mark_theme("transit-session", sev)
+                      mark_theme("transit-session", f)
                   elif cwe in (89, 943, 564) or any(k in title for k in ("sql", "nosql", "query", "database")):
-                      mark_theme("data-persistence", sev)
+                      mark_theme("data-persistence", f)
                   elif cwe in (287, 798, 306, 522, 259, 321) or any(k in title for k in ("secret", "token", "auth", "jwt", "password")):
-                      mark_theme("secrets-supply-deps", sev)
+                      mark_theme("secrets-supply-deps", f)
                   else:
-                      mark_theme("app-input-logic", sev)
+                      mark_theme("app-input-logic", f)
+
+          def build_traceability_block(item):
+              layers_summary = ", ".join(f"{k} ({v})" for k, v in sorted(item["layer_counts"].items()))
+              sorted_refs = [r[1] for r in sorted(item["evidence_refs"], key=lambda x: -x[0])[:8]]
+              filter_layers = " or ".join(sorted(item["layer_counts"].keys()))
+              return (
+                  f"**Correlated DefectDojo Layers:** {layers_summary}\n"
+                  f"**How to Filter All {item['signal_count']} Signals in DefectDojo:** "
+                  f"Go to Findings -> Filter by Asset = `{repo_name}` and Service = `{filter_layers}`\n\n"
+                  f"**Top Triggering Findings (Direct Local Links):**\n"
+                  + "\n".join(sorted_refs)
+              )
 
           dd_findings = []
 
@@ -257,7 +294,6 @@ jobs:
               tools_str = ", ".join(sorted(tool_labels))
               files_str = ", ".join(developer_tm_files)
 
-              # Record positive NIS2 Risk Analysis governance signal for the Maturity Gate
               dd_findings.append({
                   "title": f"Human-Authored Threat Model Active ({tools_str})",
                   "description": (
@@ -273,19 +309,21 @@ jobs:
                   "tags": ["threat-model", "human-authored", "nis2-compliant"]
               })
 
-              # Check if live scanners detected major risk domains not yet mentioned in text-based models
               if corpus.strip():
                   for key, item in risk_catalog.items():
                       if not item["triggered"]:
                           continue
                       if not any(kw in corpus for kw in item["doc_keywords"]):
+                          trace_block = build_traceability_block(item)
                           dd_findings.append({
                               "title": f"[Threat Model Gap] Unaddressed {item['stride']} Risk: {item['title']}",
                               "description": (
                                   f"Scanner evidence ({item['signal_count']} signals) indicates architectural exposure "
                                   f"on {item['target_name']}, which is not yet documented in {files_str}.\n\n"
-                                  f"Architectural Risk: {item['summary']}"
+                                  f"**Architectural Risk:** {item['summary']}\n\n"
+                                  f"{trace_block}"
                               ),
+                              "steps_to_reproduce": trace_block,
                               "severity": item["highest_sev"],
                               "mitigation": item["mitigation"],
                               "impact": f"Potential {item['stride']} gap between documented architecture and implementation.",
@@ -393,13 +431,16 @@ jobs:
                       "mitigation": item["mitigation"]
                   })
 
+                  trace_block = build_traceability_block(item)
                   dd_findings.append({
                       "title": f"[Starter Blueprint] {item['title']}",
                       "description": (
                           f"{item['summary']}\n\n"
-                          f"Note: Auto-generated architectural baseline ({item['signal_count']} signals). "
-                          "Developers can customize this model by committing threat-model.json or files under threat-model/."
+                          f"{trace_block}\n\n"
+                          "Note: Auto-generated architectural baseline. Developers can customize this model by committing "
+                          "threat-model.json or files under threat-model/."
                       ),
+                      "steps_to_reproduce": trace_block,
                       "severity": item["highest_sev"],
                       "mitigation": item["mitigation"],
                       "impact": f"Architectural {item['stride']} risk on {item['target_name']}.",
