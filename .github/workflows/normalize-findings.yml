@@ -1,0 +1,323 @@
+name: Normalize & Enrich DefectDojo Findings (EPSS, KEV & Links)
+on:
+  workflow_run:
+    workflows: ["Scheduled Security Scan (SAST, Trivy, Checkov, Scorecard & DefectDojo)"]
+    types:
+      - completed
+  workflow_dispatch:
+
+jobs:
+  normalize-findings:
+    name: Normalize Titles, CWEs, Links, EPSS & CISA KEV (node-goat)
+    if: github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Run DefectDojo Finding Normalizer & Threat Intel Enrichment
+        env:
+          DD_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DD_TOKEN: ${{ secrets.DEFECTDOJO_TOKEN }}
+          REPO_NAME: node-goat
+          DEFAULT_BRANCH: master
+          GITHUB_OWNER: CapyTainh
+        run: |
+          python3 - << 'EOF'
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+
+          dd_url = os.environ["DD_URL"].rstrip("/")
+          dd_token = os.environ["DD_TOKEN"]
+          repo_name = os.environ["REPO_NAME"]
+          default_branch = os.environ["DEFAULT_BRANCH"]
+          github_owner = os.environ["GITHUB_OWNER"]
+
+          def dd_request(url, method="GET", data=None):
+              headers = {
+                  "Authorization": f"Token {dd_token}",
+                  "Content-Type": "application/json",
+              }
+              body = json.dumps(data).encode("utf-8") if data is not None else None
+              req = urllib.request.Request(url, data=body, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  raw = resp.read().decode("utf-8")
+                  return json.loads(raw) if raw else {}
+
+          # 1. Fetch all active findings for this repository from DefectDojo
+          findings = []
+          next_url = f"{dd_url}/api/v2/findings/?product_name={urllib.parse.quote(repo_name)}&active=true&limit=250"
+          while next_url:
+              payload = dd_request(next_url)
+              findings.extend(payload.get("results", []))
+              next_url = payload.get("next")
+
+          print(f"Fetched {len(findings)} active findings for {repo_name}.")
+          if not findings:
+              raise SystemExit(0)
+
+          # 2. Collect all unique CVEs across findings
+          cve_pattern = re.compile(r"CVE-\d{4}-\d{4,19}", re.IGNORECASE)
+          all_cves = set()
+          for f in findings:
+              if f.get("cve"):
+                  all_cves.add(f["cve"].upper())
+              for match in cve_pattern.findall(f.get("title") or ""):
+                  all_cves.add(match.upper())
+
+          # 3. Query FIRST EPSS API in batches of 50 CVEs
+          epss_map = {}
+          cve_list = sorted(all_cves)
+          for i in range(0, len(cve_list), 50):
+              batch = ",".join(cve_list[i:i + 50])
+              epss_url = f"https://api.first.org/data/v1/epss?cve={batch}"
+              try:
+                  req = urllib.request.Request(epss_url, headers={"User-Agent": "DevSecOps-Normalizer/1.0"})
+                  with urllib.request.urlopen(req, timeout=25) as resp:
+                      epss_payload = json.loads(resp.read().decode("utf-8"))
+                      for row in epss_payload.get("data", []):
+                          c_id = row.get("cve", "").upper()
+                          epss_map[c_id] = {
+                              "epss": float(row.get("epss", 0.0)),
+                              "percentile": float(row.get("percentile", 0.0)),
+                          }
+              except Exception as exc:
+                  print(f"Warning: EPSS lookup failed for batch: {exc}")
+
+          print(f"Retrieved EPSS scores for {len(epss_map)} / {len(cve_list)} CVEs.")
+
+          # 4. Fetch CISA Known Exploited Vulnerabilities (KEV) JSON catalog
+          kev_map = {}
+          kev_url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+          try:
+              req = urllib.request.Request(kev_url, headers={"User-Agent": "DevSecOps-Normalizer/1.0"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  kev_payload = json.loads(resp.read().decode("utf-8"))
+                  for vuln in kev_payload.get("vulnerabilities", []):
+                      c_id = vuln.get("cveID", "").upper()
+                      if c_id:
+                          kev_map[c_id] = {
+                              "name": vuln.get("vulnerabilityName", ""),
+                              "dateAdded": vuln.get("dateAdded", ""),
+                              "dueDate": vuln.get("dueDate", ""),
+                              "ransomware": vuln.get("knownRansomwareCampaignUse", "Unknown") == "Known",
+                              "action": vuln.get("requiredAction", ""),
+                          }
+          except Exception as exc:
+              print(f"Warning: CISA KEV catalog download failed: {exc}")
+
+          print(f"Loaded {len(kev_map)} CISA KEV entries.")
+
+          # 5. Human-readable CWE label lookup for clean vulnerability titles
+          cwe_names = {
+              20: "Improper Input Validation",
+              22: "Path Traversal",
+              78: "OS Command Injection",
+              79: "Cross-Site Scripting (XSS)",
+              89: "SQL Injection",
+              94: "Code Injection",
+              116: "Improper Output Encoding / Code Execution",
+              122: "Heap Buffer Overflow",
+              190: "Integer Overflow",
+              200: "Sensitive Information Exposure",
+              250: "Execution with Unnecessary Privileges",
+              287: "Improper Authentication",
+              295: "Improper Certificate Validation",
+              306: "Missing Authentication for Critical Function",
+              319: "Cleartext Transmission of Sensitive Information",
+              327: "Broken or Risky Cryptographic Algorithm",
+              330: "Insufficiently Random Values",
+              345: "Insufficient Verification of Data Authenticity",
+              352: "Cross-Site Request Forgery (CSRF)",
+              362: "Race Condition",
+              400: "Uncontrolled Resource Consumption (DoS)",
+              415: "Double Free",
+              416: "Use After Free",
+              476: "NULL Pointer Dereference",
+              502: "Deserialization of Untrusted Data",
+              601: "Open Redirect",
+              611: "XML External Entity (XXE)",
+              697: "Incorrect Comparison",
+              770: "Allocation of Resources Without Limits",
+              787: "Out-of-bounds Write",
+              798: "Hardcoded Credentials / Secret Exposure",
+              843: "Type Confusion",
+              918: "Server-Side Request Forgery (SSRF)",
+              943: "NoSQL / Query Injection",
+              1050: "Excessive Platform Resource Consumption",
+              1321: "Prototype Pollution",
+              1333: "Inefficient Regular Expression (ReDoS)",
+              1357: "Reliance on Uncontrolled Component / Mutable Tag",
+          }
+
+          def infer_cwe(svc, title, existing_cwe):
+              if existing_cwe:
+                  return existing_cwe
+              t = title.lower()
+              if svc == "dependency-layer" and ("secret" in t or "key" in t or "token" in t or "password" in t):
+                  return 798
+              if svc in ("iac-cicd-layer", "governance-posture"):
+                  if "root" in t or "privilege" in t or "write-all" in t or "permission" in t:
+                      return 250
+                  if "pin" in t or "hash" in t or "mutable" in t:
+                      return 1357
+                  if "branch" in t or "review" in t or "signed" in t:
+                      return 345
+                  if "curl" in t or "secret" in t:
+                      return 798
+              return None
+
+          # Track dependency-layer (CVE, package) pairs to deduplicate overlapping container-layer app packages
+          dep_cve_pkgs = set()
+          for f in findings:
+              if (f.get("service") or "") == "dependency-layer":
+                  c = (f.get("cve") or "").upper()
+                  comp = (f.get("component_name") or "").lower()
+                  if c and comp:
+                      dep_cve_pkgs.add((c, comp))
+
+          updated_count = 0
+          deduped_count = 0
+
+          for f in findings:
+              fid = f["id"]
+              svc = f.get("service") or "code-layer"
+              if svc == "threat-model-layer":
+                  continue
+
+              raw_title = (f.get("title") or "").strip()
+              desc = f.get("description") or ""
+              file_path = (f.get("file_path") or "").lstrip("/")
+              line_no = f.get("line")
+              comp_name = (f.get("component_name") or "").strip()
+              comp_ver = (f.get("component_version") or "").strip()
+              existing_cwe = f.get("cwe")
+              tags = list(f.get("tags") or [])
+
+              # Extract CVE if missing from dedicated field
+              cve = (f.get("cve") or "").upper()
+              if not cve:
+                  m = cve_pattern.search(raw_title)
+                  if m:
+                      cve = m.group(0).upper()
+
+              cwe = infer_cwe(svc, raw_title, existing_cwe)
+              weakness_label = cwe_names.get(cwe, "")
+
+              # Cross-layer deduplication: close container-layer app packages already covered in dependency-layer
+              is_cross_layer_dup = False
+              if svc == "container-layer" and cve and comp_name:
+                  fp_low = file_path.lower()
+                  if any(p in fp_low for p in ("node_modules/", "vendor/", "site-packages/", "package.json")):
+                      if (cve, comp_name.lower()) in dep_cve_pkgs:
+                          is_cross_layer_dup = True
+
+              # Build clean, non-repetitive human-readable title
+              short_file = os.path.basename(file_path) if file_path and "no file" not in file_path.lower() else ""
+              loc_suffix = f"{short_file}:{line_no}" if (short_file and line_no) else short_file
+
+              if svc in ("dependency-layer", "container-layer") and cve:
+                  layer_prefix = "Container OS" if svc == "container-layer" else "Dependency"
+                  pkg_str = f"{comp_name}@{comp_ver}" if (comp_name and comp_ver) else (comp_name or "Package")
+                  w_part = weakness_label or (kev_map[cve]["name"] if cve in kev_map else "Known Vulnerability")
+                  clean_title = f"[{layer_prefix}: {pkg_str}] {w_part} ({cve})"
+              elif svc == "dependency-layer" and ("secret" in raw_title.lower() or cwe == 798):
+                  clean_title = f"[Exposed Secret] {raw_title} ({loc_suffix or file_path})"
+              elif svc == "code-layer":
+                  # Strip SARIF markdown artifacts like [User-Provided Value](1)
+                  cleaned = re.sub(r"\[([^\]]+)\]\(\d+\)", r"\1", raw_title).rstrip(".")
+                  # Strip Semgrep dotted rule prefixes like php.lang.security.injection.tainted-sql-string.tainted-sql-string
+                  if "." in cleaned and " " not in cleaned:
+                      cleaned = cleaned.split(".")[-1].replace("-", " ").title()
+                  clean_title = f"[SAST] {cleaned} ({loc_suffix})" if loc_suffix else f"[SAST] {cleaned}"
+              elif svc == "iac-cicd-layer":
+                  clean_title = f"[IaC / CI-CD] {raw_title} ({loc_suffix})" if loc_suffix else f"[IaC / CI-CD] {raw_title}"
+              elif svc == "governance-posture":
+                  # Trim verbose Scorecard remediation tips from the title
+                  short_sc = raw_title.split("Remediation Tip:")[0].split("Warn:")[0].strip().rstrip(":")
+                  short_sc = re.sub(r"^Score Is \d+:\s*", "", short_sc, flags=re.IGNORECASE)
+                  clean_title = f"[Supply Chain Posture] {short_sc}" + (f" ({short_file})" if short_file else "")
+              else:
+                  clean_title = raw_title
+
+              # Truncate to DefectDojo's 500-char title limit safely
+              clean_title = clean_title[:490]
+
+              # Build clickable references (GitHub source line link + NVD + CWE)
+              ref_links = []
+              if file_path and "no file" not in file_path.lower() and not file_path.startswith("local-scan:"):
+                  encoded_path = urllib.parse.quote(file_path)
+                  gh_url = f"https://github.com/{github_owner}/{repo_name}/blob/{default_branch}/{encoded_path}"
+                  if line_no:
+                      gh_url += f"#L{line_no}"
+                  ref_links.append(f"GitHub Source: {gh_url}")
+              if cve:
+                  ref_links.append(f"NVD Advisory: https://nvd.nist.gov/vuln/detail/{cve}")
+              if cwe:
+                  ref_links.append(f"CWE Definition: https://cwe.mitre.org/data/definitions/{cwe}.html")
+
+              existing_refs = (f.get("references") or "").strip()
+              merged_refs = "\n".join(ref_links)
+              if existing_refs and "GitHub Source:" not in existing_refs:
+                  merged_refs = f"{merged_refs}\n{existing_refs}".strip()
+
+              # Prepare PATCH payload (DefectDojo requires explicit booleans for known_exploited/ransomware_used)
+              patch_data = {
+                  "title": clean_title,
+                  "references": merged_refs,
+                  "known_exploited": bool(f.get("known_exploited", False)),
+                  "ransomware_used": bool(f.get("ransomware_used", False)),
+              }
+              if cwe:
+                  patch_data["cwe"] = cwe
+
+              # Enrich with EPSS & CISA KEV if CVE is present
+              banner_notes = []
+              if cve and cve in epss_map:
+                  epss_val = epss_map[cve]["epss"]
+                  pct_val = epss_map[cve]["percentile"]
+                  patch_data["epss_score"] = round(epss_val, 5)
+                  patch_data["epss_percentile"] = round(pct_val, 5)
+                  if epss_val >= 0.10 and "high-epss" not in tags:
+                      tags.append("high-epss")
+                  banner_notes.append(f"**EPSS Exploit Probability:** {epss_val * 100:.2f}% (Percentile: {pct_val * 100:.1f}%)")
+
+              if cve and cve in kev_map:
+                  kev_info = kev_map[cve]
+                  patch_data["known_exploited"] = True
+                  patch_data["ransomware_used"] = kev_info["ransomware"]
+                  if kev_info["dateAdded"]:
+                      patch_data["kev_date"] = kev_info["dateAdded"]
+                  if "cisa-kev" not in tags:
+                      tags.append("cisa-kev")
+                  banner_notes.append(
+                      f"**[CISA KEV ACTIVE EXPLOITATION]** Added: {kev_info['dateAdded']} | "
+                      f"Ransomware Campaign Use: {'Yes' if kev_info['ransomware'] else 'Unknown'} | "
+                      f"Required Action: {kev_info['action']}"
+                  )
+
+              if "normalized" not in tags:
+                  tags.append("normalized")
+
+              if is_cross_layer_dup:
+                  patch_data["active"] = False
+                  patch_data["is_mitigated"] = True
+                  if "cross-layer-deduped" not in tags:
+                      tags.append("cross-layer-deduped")
+                  deduped_count += 1
+
+              patch_data["tags"] = tags
+
+              if banner_notes and "EPSS Exploit Probability:" not in desc and "[CISA KEV ACTIVE EXPLOITATION]" not in desc:
+                  patch_data["description"] = "\n".join(banner_notes) + "\n\n" + desc
+
+              try:
+                  dd_request(f"{dd_url}/api/v2/findings/{fid}/", method="PATCH", data=patch_data)
+                  updated_count += 1
+              except Exception as exc:
+                  print(f"Warning: Failed to update finding {fid}: {exc}")
+
+          print(f"Normalization complete: {updated_count} findings enriched, {deduped_count} cross-layer container duplicates closed.")
+          EOF
