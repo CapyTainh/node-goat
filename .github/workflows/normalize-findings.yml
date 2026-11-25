@@ -67,11 +67,10 @@ jobs:
           direct_prod_pkgs = set()
           direct_dev_pkgs = set()
           lock_dev_pkgs = set()
-          lockfile_packages = []  # (eco, pkg_name, pkg_ver, lockfile_path)
+          lockfile_packages = []
           ecosystems_needed = set()
 
-          # Index first-party source files to detect whether a dependency is imported directly
-          source_code_files = []  # (rel_path, content_lower)
+          source_code_files = []
           code_exts = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".php", ".go", ".java", ".rb")
 
           for root, dirs, files in os.walk("."):
@@ -249,8 +248,8 @@ jobs:
                       ),
                       "severity": "Critical",
                       "severity_justification": (
-                          f"P0 Immediate Blocker: Package '{pname}@{pver}' matches confirmed OpenSSF/OSV supply-chain malware "
-                          f"({', '.join(mal_ids)}). Intentional malware executes during install or runtime regardless of CVE status."
+                          f"Priority: P0 — Immediate Blocker (24-48h SLA).\n"
+                          f"Package '{pname}@{pver}' matches confirmed OpenSSF/OSV supply-chain malware ({', '.join(mal_ids)})."
                       ),
                       "cwe": 506,
                       "mitigation": f"Remove malicious package '{pname}@{pver}' immediately, rotate any secrets/tokens exposed on build or runtime hosts, and audit lockfile history.",
@@ -262,7 +261,7 @@ jobs:
                       "known_exploited": True,
                       "unique_id_from_tool": f"osv-mal-{eco}-{pname}-{pver}",
                       "vuln_id_from_tool": mal_ids[0],
-                      "tags": ["sca", "osv-malicious-package", "supply-chain-malware", "normalized"]
+                      "tags": ["sca", "osv-malicious-package", "supply-chain-malware"]
                   })
 
           print(f"Scanned {len(lockfile_packages)} lockfile package entries offline against OSV malware index.")
@@ -422,7 +421,6 @@ jobs:
                       return 798
               return None
 
-          # Track dependency-layer (CVE, normalized_pkg) pairs to deduplicate overlapping container-layer app packages
           dep_cve_pkgs = set()
           for f in findings:
               if (f.get("service") or "") == "dependency-layer":
@@ -476,6 +474,9 @@ jobs:
 
               return "\n".join(clean_links[:6])
 
+          # Helper to strip trailing (filename:line) or (filename) suffixes from titles
+          trailing_loc_re = re.compile(r"(?:\s*\([^()]+\.(?:js|jsx|ts|tsx|mjs|cjs|py|php|go|java|rb|yml|yaml|json|tf|sh|html|css)(?::[0-9]+)?\))+$", re.IGNORECASE)
+
           updated_count = 0
           deduped_count = 0
           mal_flagged_count = len(lockfile_mal_findings)
@@ -491,13 +492,16 @@ jobs:
               raw_mitigation = (f.get("mitigation") or "").strip()
               raw_impact = (f.get("impact") or "").strip()
               raw_steps = (f.get("steps_to_reproduce") or "").strip()
+              raw_justification = (f.get("severity_justification") or "").strip()
               file_path = (f.get("file_path") or "").lstrip("/")
               line_no = f.get("line")
               comp_name = (f.get("component_name") or "").strip()
               comp_ver = (f.get("component_version") or "").strip()
               existing_cwe = f.get("cwe")
-              tags = list(f.get("tags") or [])
               sev = f.get("severity", "Medium")
+
+              # Remove noisy 'normalized' tag if present from earlier runs
+              tags = [t for t in (f.get("tags") or []) if t.lower() != "normalized"]
 
               cve = (f.get("cve") or "").upper()
               if not cve:
@@ -520,10 +524,7 @@ jobs:
                       if (cve, comp_name.lower()) in dep_cve_pkgs:
                           is_cross_layer_dup = True
 
-              # Idempotent clean title generation (strip previous prefixes/suffixes first so re-runs never double-prefix)
-              short_file = os.path.basename(file_path) if file_path and "no file" not in file_path.lower() else ""
-              loc_suffix = f"{short_file}:{line_no}" if (short_file and line_no) else short_file
-
+              # Clean vulnerability-only titles (File Path and Line already live in DefectDojo's native columns)
               if mal_ids:
                   pkg_str = f"{comp_name}@{comp_ver}" if comp_ver else comp_name
                   clean_title = f"[MALICIOUS PACKAGE: {pkg_str}] Supply-Chain Malware ({', '.join(mal_ids)})"
@@ -534,27 +535,25 @@ jobs:
                   clean_title = f"[{layer_prefix}: {pkg_str}] {w_part} ({cve})"
               elif svc == "dependency-layer" and ("secret" in raw_title.lower() or cwe == 798):
                   base_secret = re.sub(r"^(\[Exposed Secret\]\s*)+", "", raw_title, flags=re.IGNORECASE)
-                  if loc_suffix and base_secret.endswith(f"({loc_suffix})"):
-                      base_secret = base_secret[:-(len(loc_suffix) + 3)].strip()
-                  clean_title = f"[Exposed Secret] {base_secret} ({loc_suffix or file_path})"
+                  base_secret = trailing_loc_re.sub("", base_secret).strip()
+                  clean_title = f"[Exposed Secret] {base_secret}"
               elif svc == "code-layer":
                   cleaned = re.sub(r"^(\[SAST\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
-                  if loc_suffix and cleaned.endswith(f"({loc_suffix})"):
-                      cleaned = cleaned[:-(len(loc_suffix) + 3)].strip()
+                  cleaned = trailing_loc_re.sub("", cleaned).strip()
                   cleaned = re.sub(r"\[([^]]+)\]\([0-9]+\)", r"\1", cleaned).rstrip(".")
                   if "." in cleaned and " " not in cleaned:
                       cleaned = cleaned.split(".")[-1].replace("-", " ").title()
-                  clean_title = f"[SAST] {cleaned} ({loc_suffix})" if loc_suffix else f"[SAST] {cleaned}"
+                  clean_title = f"[SAST] {cleaned}"
               elif svc == "iac-cicd-layer":
                   cleaned_iac = re.sub(r"^(\[IaC / CI-CD\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
-                  if loc_suffix and cleaned_iac.endswith(f"({loc_suffix})"):
-                      cleaned_iac = cleaned_iac[:-(len(loc_suffix) + 3)].strip()
-                  clean_title = f"[IaC / CI-CD] {cleaned_iac} ({loc_suffix})" if loc_suffix else f"[IaC / CI-CD] {cleaned_iac}"
+                  cleaned_iac = trailing_loc_re.sub("", cleaned_iac).strip()
+                  clean_title = f"[IaC / CI-CD] {cleaned_iac}"
               elif svc == "governance-posture":
                   cleaned_sc = re.sub(r"^(\[Supply Chain Posture\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
                   short_sc = cleaned_sc.split("Remediation Tip:")[0].split("Warn:")[0].strip().rstrip(":")
                   short_sc = re.sub(r"^Score Is [0-9]+:\s*", "", short_sc, flags=re.IGNORECASE)
-                  clean_title = f"[Supply Chain Posture] {short_sc}" + (f" ({short_file})" if short_file and not short_sc.endswith(f"({short_file})") else "")
+                  short_sc = trailing_loc_re.sub("", short_sc).strip()
+                  clean_title = f"[Supply Chain Posture] {short_sc}"
               else:
                   clean_title = raw_title
 
@@ -581,26 +580,50 @@ jobs:
                   f.get("references") or "", cve, cwe, mal_ids, svc, file_path, line_no
               )
 
-              # Build clear Severity Justification explaining EPSS, Percentile, KEV, OSV & Priority Tier
+              # Balanced Human-in-the-Loop Severity & Priority Justification
               epss_val = epss_map[cve]["epss"] if (cve and cve in epss_map) else None
               pct_val = epss_map[cve]["percentile"] if (cve and cve in epss_map) else None
               kev_info = kev_map.get(cve) if cve else None
-              has_public_advisory = bool(cve or mal_hits)
+
+              lower_tags = {t.lower() for t in tags}
+              human_override = any(t in lower_tags for t in ("priority-confirmed", "p0", "p1", "p2", "p3"))
 
               if mal_hits or kev_info:
-                  tier_label = "P0 — Immediate Blocker (24-48h SLA)"
+                  proposed_tier = "P0 — Immediate Blocker (24-48h SLA)"
+                  review_note = "Confirmed active threat intelligence (CISA KEV / OSV Malware); immediate remediation required."
               elif epss_val is not None and (epss_val >= 0.10 or (sev in ("Critical", "High") and epss_val >= 0.04)):
-                  tier_label = "P1 — Urgent Remediation (7-day SLA)"
-              elif svc == "code-layer" and sev in ("Critical", "High"):
-                  tier_label = "P1 — Urgent Code Fix (Pending DAST/Pentest Reachability Confirmation)"
-              elif epss_val is not None and epss_val >= 0.01:
-                  tier_label = "P2 — Scheduled Sprint Remediation (30-day SLA)"
+                  proposed_tier = "P1 — Urgent Remediation (7-day SLA)"
+                  review_note = "High scanner severity backed by elevated real-world exploitation probability (EPSS)."
+              elif sev == "Critical":
+                  proposed_tier = "P1/P2 (Proposed) — Security Engineer Review Required"
+                  review_note = (
+                      "Scanner/CVSS severity is Critical, but active exploitation probability (EPSS/KEV) is currently low. "
+                      "A security engineer should review exposure and reachability to confirm whether to keep as P1 or downgrade to P2/P3 "
+                      "(tag finding with 'priority-confirmed' or 'p1'/'p2'/'p3' once triaged)."
+                  )
+              elif sev == "High":
+                  if svc == "code-layer":
+                      proposed_tier = "P2 (Proposed) — Security Engineer & Developer Code Review"
+                      review_note = (
+                          "High-severity static code weakness. Verify whether the sink is reachable from untrusted HTTP/API routes "
+                          "(vs. test/internal utilities) before scheduling remediation."
+                      )
+                  else:
+                      proposed_tier = "P2 (Proposed) — Security Engineer Review Required"
+                      review_note = (
+                          "Scanner severity is High with low/moderate EPSS. Security engineer should confirm runtime exposure "
+                          "before assigning sprint SLA."
+                      )
               else:
-                  tier_label = "P3 — Standard Backlog / Low Active Exploitation Likelihood"
+                  proposed_tier = "P3 — Standard Backlog"
+                  review_note = "Moderate/low scanner severity and low active exploitation likelihood."
 
-              just_lines = [f"Priority Tier: {tier_label} (Scanner Severity: {sev})."]
+              just_lines = [
+                  f"Proposed Priority: {proposed_tier} (Scanner Severity: {sev}).",
+                  f"- Triage Guidance: {review_note}",
+              ]
               if mal_hits:
-                  just_lines.append(f"- OSV Supply-Chain Malware: CONFIRMED ({', '.join(mal_ids)}). Intentional malicious code.")
+                  just_lines.append(f"- OSV Supply-Chain Malware: CONFIRMED ({', '.join(mal_ids)}).")
               if kev_info:
                   just_lines.append(
                       f"- CISA KEV Status: CONFIRMED EXPLOITED IN THE WILD (Added {kev_info['dateAdded']}; "
@@ -612,15 +635,15 @@ jobs:
               if epss_val is not None:
                   just_lines.append(
                       f"- FIRST EPSS Score: {epss_val * 100:.2f}% probability of exploitation within 30 days "
-                      f"(Percentile: {pct_val * 100:.1f}% — higher risk than {pct_val * 100:.1f}% of all scored CVEs)."
+                      f"(Percentile: {pct_val * 100:.1f}% — higher than {pct_val * 100:.1f}% of all scored CVEs)."
                   )
               elif not cve:
-                  just_lines.append("- FIRST EPSS Score: N/A (Code/configuration weakness without a CVE; evaluated via CWE impact and runtime reachability).")
+                  just_lines.append("- FIRST EPSS Score: N/A (Code/configuration weakness without a CVE; evaluated via CWE impact and code context).")
 
               if cve:
-                  just_lines.append(f"- Public Advisory / Exploit Tracking: Tracked under {cve} (see NVD/GHSA links in References).")
+                  just_lines.append(f"- Public Advisory Tracking: {cve} (see NVD/GHSA links in References).")
 
-              severity_justification = "\n".join(just_lines)
+              severity_justification = raw_justification if human_override else "\n".join(just_lines)
 
               # Build SCA False-Positive & Reachability Triage Guide in Steps To Reproduce
               steps_out = raw_steps
@@ -655,9 +678,9 @@ jobs:
                       f"- **Dependency Scope:** {scope_str}\n"
                       f"- **Dependency Depth:** {rel_str}\n"
                       f"- **Source Code Reachability:** {reach_str}\n\n"
-                      f"**How Developers Verify If This Is a False Positive:**\n"
-                      f"1. Run `npm ls {comp_name}` (or check lockfile tree) to see which top-level package pulls in `{comp_name}@{comp_ver}`.\n"
-                      f"2. Check the vulnerability description for the specific affected function (e.g., `expand()`, `template()`, or prototype merge).\n"
+                      f"**How Developers & Security Engineers Verify If This Is a False Positive:**\n"
+                      f"1. Run `npm ls {comp_name}` (or inspect lockfile tree) to see which parent package pulls in `{comp_name}@{comp_ver}`.\n"
+                      f"2. Check the vulnerability description for the specific affected function.\n"
                       f"3. If `{comp_name}` is dev-only or the vulnerable function is never executed with untrusted input in your environment, mark as **False Positive / Risk Accepted** in DefectDojo with justification; otherwise upgrade to the fixed version."
                   )
                   if not steps_out or "**Automated SCA Reachability & False-Positive Check:**" in steps_out:
@@ -710,9 +733,6 @@ jobs:
                       f"Ransomware Campaign Use: {'Yes' if kev_info['ransomware'] else 'Unknown'} | "
                       f"Required Action: {kev_info['action']}"
                   )
-
-              if "normalized" not in tags:
-                  tags.append("normalized")
 
               if is_cross_layer_dup:
                   patch_data["active"] = False
