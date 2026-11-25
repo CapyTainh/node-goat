@@ -8,12 +8,17 @@ on:
 
 jobs:
   normalize-findings:
-    name: Normalize Titles, CWEs, Links, EPSS, KEV & Offline OSV (node-goat)
+    name: Normalize Titles, Impact, Advisories, EPSS, KEV & Offline OSV (node-goat)
     if: github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
+      - name: Checkout Repository (for Offline Lockfile Malware Check)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Run DefectDojo Finding Normalizer & Offline Threat Intel Enrichment
         env:
           DD_URL: ${{ secrets.DEFECTDOJO_URL }}
@@ -57,62 +62,8 @@ jobs:
               next_url = payload.get("next")
 
           print(f"Fetched {len(findings)} active findings for {repo_name}.")
-          if not findings:
-              raise SystemExit(0)
 
-          # 2. Collect all unique CVEs across findings (CVE IDs are public identifiers, not private package names)
-          cve_pattern = re.compile(r"CVE-[0-9]{4}-[0-9]{4,19}", re.IGNORECASE)
-          all_cves = set()
-          for f in findings:
-              if f.get("cve"):
-                  all_cves.add(f["cve"].upper())
-              for match in cve_pattern.findall(f.get("title") or ""):
-                  all_cves.add(match.upper())
-
-          # 3. Query FIRST EPSS API in batches of 50 public CVE IDs
-          epss_map = {}
-          cve_list = sorted(all_cves)
-          for i in range(0, len(cve_list), 50):
-              batch = ",".join(cve_list[i:i + 50])
-              epss_url = f"https://api.first.org/data/v1/epss?cve={batch}"
-              try:
-                  req = urllib.request.Request(epss_url, headers={"User-Agent": "DevSecOps-Normalizer/1.0"})
-                  with urllib.request.urlopen(req, timeout=25) as resp:
-                      epss_payload = json.loads(resp.read().decode("utf-8"))
-                      for row in epss_payload.get("data", []):
-                          c_id = row.get("cve", "").upper()
-                          epss_map[c_id] = {
-                              "epss": float(row.get("epss", 0.0)),
-                              "percentile": float(row.get("percentile", 0.0)),
-                          }
-              except Exception as exc:
-                  print(f"Warning: EPSS lookup failed for batch: {exc}")
-
-          print(f"Retrieved EPSS scores for {len(epss_map)} / {len(cve_list)} CVEs.")
-
-          # 4. Download full CISA KEV JSON catalog locally and match offline
-          kev_map = {}
-          kev_url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-          try:
-              req = urllib.request.Request(kev_url, headers={"User-Agent": "DevSecOps-Normalizer/1.0"})
-              with urllib.request.urlopen(req, timeout=30) as resp:
-                  kev_payload = json.loads(resp.read().decode("utf-8"))
-                  for vuln in kev_payload.get("vulnerabilities", []):
-                      c_id = vuln.get("cveID", "").upper()
-                      if c_id:
-                          kev_map[c_id] = {
-                              "name": vuln.get("vulnerabilityName", ""),
-                              "dateAdded": vuln.get("dateAdded", ""),
-                              "dueDate": vuln.get("dueDate", ""),
-                              "ransomware": vuln.get("knownRansomwareCampaignUse", "Unknown") == "Known",
-                              "action": vuln.get("requiredAction", ""),
-                          }
-          except Exception as exc:
-              print(f"Warning: CISA KEV catalog download failed: {exc}")
-
-          print(f"Loaded {len(kev_map)} CISA KEV entries locally.")
-
-          # 5. Zero-Leak OSV Malware Matching (Download public ecosystem ZIPs & match 100% locally)
+          # 2. Zero-Leak OSV Malware Matching (Download public ecosystem ZIPs & match 100% locally)
           def infer_osv_ecosystem(tags_list, file_path):
               tset = {t.lower() for t in tags_list}
               fp = file_path.lower()
@@ -137,18 +88,61 @@ jobs:
                   if eco:
                       ecosystems_needed.add(eco)
 
-          # Download only the public ecosystem dumps for ecosystems actually present in this repo
-          # Structure: local_mal_index[(eco, pkg_lower)] = list of {"id": "MAL-...", "versions": set(...), "summary": "..."}
+          # Also detect ecosystems directly from repository lockfiles so zero-CVE MAL-* packages are caught
+          lockfile_packages = []  # list of (eco, pkg_name, pkg_ver, lockfile_path)
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "vendor", ".venv")]
+              for fname in files:
+                  rel_path = os.path.relpath(os.path.join(root, fname), ".").replace("\\", "/")
+                  if fname == "package-lock.json":
+                      ecosystems_needed.add("npm")
+                      try:
+                          with open(rel_path, "r", encoding="utf-8", errors="ignore") as lf:
+                              lock_data = json.load(lf)
+                          # npm lockfile v2/v3 'packages'
+                          for pkg_path, meta in (lock_data.get("packages") or {}).items():
+                              if not pkg_path:
+                                  continue
+                              pname = pkg_path.split("node_modules/")[-1]
+                              pver = meta.get("version", "")
+                              if pname and pver:
+                                  lockfile_packages.append(("npm", pname, pver, rel_path))
+                          # npm lockfile v1 'dependencies'
+                          def walk_v1_deps(deps_dict):
+                              for dname, dmeta in (deps_dict or {}).items():
+                                  dver = dmeta.get("version", "")
+                                  if dname and dver:
+                                      lockfile_packages.append(("npm", dname, dver, rel_path))
+                                  if "dependencies" in dmeta:
+                                      walk_v1_deps(dmeta["dependencies"])
+                          walk_v1_deps(lock_data.get("dependencies"))
+                      except Exception:
+                          pass
+                  elif fname == "composer.lock":
+                      ecosystems_needed.add("Packagist")
+                      try:
+                          with open(rel_path, "r", encoding="utf-8", errors="ignore") as lf:
+                              cdata = json.load(lf)
+                          for pkg in (cdata.get("packages") or []) + (cdata.get("packages-dev") or []):
+                              pname = pkg.get("name", "")
+                              pver = (pkg.get("version") or "").lstrip("v")
+                              if pname and pver:
+                                  lockfile_packages.append(("Packagist", pname, pver, rel_path))
+                      except Exception:
+                          pass
+                  elif fname == "requirements.txt":
+                      ecosystems_needed.add("PyPI")
+
           local_mal_index = {}
           for eco in sorted(ecosystems_needed):
               dump_url = f"https://storage.googleapis.com/osv-vulnerabilities/{urllib.parse.quote(eco)}/all.zip"
+              mal_records_loaded = 0
               try:
                   req = urllib.request.Request(dump_url, headers={"User-Agent": "DevSecOps-Normalizer/1.0"})
                   with urllib.request.urlopen(req, timeout=45) as resp:
                       zip_bytes = resp.read()
                   with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
                       for member in zf.namelist():
-                          # Only load MAL-* malicious package advisories into memory
                           if not os.path.basename(member).startswith("MAL-") or not member.endswith(".json"):
                               continue
                           record = json.loads(zf.read(member).decode("utf-8"))
@@ -156,20 +150,20 @@ jobs:
                               continue
                           mal_id = record.get("id", "")
                           summary = record.get("summary") or record.get("details") or "Confirmed malicious package in OpenSSF/OSV."
+                          mal_records_loaded += 1
                           for aff in record.get("affected", []):
                               pkg_obj = aff.get("package") or {}
                               pname = (pkg_obj.get("name") or "").lower()
                               if not pname:
                                   continue
                               vers = set(aff.get("versions") or [])
-                              # If no explicit versions list (all versions malicious), empty set indicates wildcard
                               local_mal_index.setdefault((eco, pname), []).append({
                                   "id": mal_id,
                                   "versions": vers,
                                   "has_ranges": bool(aff.get("ranges")),
                                   "summary": summary,
                               })
-                  print(f"Downloaded and indexed OSV malware records for ecosystem '{eco}' completely offline.")
+                  print(f"OSV offline index ready for '{eco}': loaded {mal_records_loaded} MAL-* malware advisories.")
               except Exception as exc:
                   print(f"Warning: Could not download OSV bulk dump for {eco}: {exc}")
 
@@ -185,12 +179,104 @@ jobs:
                       hits.append(entry)
               return hits
 
-          # 6. Human-readable CWE label lookup
+          # Scan full lockfile inventory offline for zero-CVE malicious packages
+          seen_lock_hits = set()
+          lockfile_mal_findings = []
+          for eco, pname, pver, lpath in lockfile_packages:
+              hits = match_local_malware(eco, pname, pver)
+              if hits:
+                  key = (eco, pname.lower(), pver, lpath)
+                  if key in seen_lock_hits:
+                      continue
+                  seen_lock_hits.add(key)
+                  mal_ids = sorted({h["id"] for h in hits})
+                  lockfile_mal_findings.append({
+                      "title": f"[MALICIOUS PACKAGE: {pname}@{pver}] Supply-Chain Malware ({', '.join(mal_ids)})",
+                      "description": (
+                          f"**[OSV MALICIOUS PACKAGE DETECTED: {', '.join(mal_ids)}]**\n"
+                          f"{hits[0]['summary'][:500]}\n\n"
+                          f"Detected offline in `{lpath}` ({eco} ecosystem)."
+                      ),
+                      "severity": "Critical",
+                      "cwe": 506,
+                      "mitigation": f"Remove malicious package '{pname}@{pver}' immediately, rotate any secrets/tokens exposed on build or runtime hosts, and audit lockfile history.",
+                      "impact": "Embedded malicious code can exfiltrate credentials, environment variables, or establish unauthorized remote access.",
+                      "references": "\n".join(f"OSV Malware Advisory: https://osv.dev/vulnerability/{mid}" for mid in mal_ids[:3]),
+                      "file_path": lpath,
+                      "component_name": pname,
+                      "component_version": pver,
+                      "known_exploited": True,
+                      "unique_id_from_tool": f"osv-mal-{eco}-{pname}-{pver}",
+                      "vuln_id_from_tool": mal_ids[0],
+                      "tags": ["sca", "osv-malicious-package", "supply-chain-malware", "normalized"]
+                  })
+
+          if lockfile_mal_findings:
+              print(f"ALERT: Found {len(lockfile_mal_findings)} malicious package(s) in repository lockfiles! Importing to DefectDojo...")
+              with open("osv-malware-import.json", "w", encoding="utf-8") as mf:
+                  json.dump({"findings": lockfile_mal_findings}, mf, indent=2)
+
+          if not findings:
+              raise SystemExit(0)
+
+          # 3. Collect all unique CVEs across findings
+          cve_pattern = re.compile(r"CVE-[0-9]{4}-[0-9]{4,19}", re.IGNORECASE)
+          all_cves = set()
+          for f in findings:
+              if f.get("cve"):
+                  all_cves.add(f["cve"].upper())
+              for match in cve_pattern.findall(f.get("title") or ""):
+                  all_cves.add(match.upper())
+
+          # 4. Query FIRST EPSS API in batches of 50 public CVE IDs
+          epss_map = {}
+          cve_list = sorted(all_cves)
+          for i in range(0, len(cve_list), 50):
+              batch = ",".join(cve_list[i:i + 50])
+              epss_url = f"https://api.first.org/data/v1/epss?cve={batch}"
+              try:
+                  req = urllib.request.Request(epss_url, headers={"User-Agent": "DevSecOps-Normalizer/1.0"})
+                  with urllib.request.urlopen(req, timeout=25) as resp:
+                      epss_payload = json.loads(resp.read().decode("utf-8"))
+                      for row in epss_payload.get("data", []):
+                          c_id = row.get("cve", "").upper()
+                          epss_map[c_id] = {
+                              "epss": float(row.get("epss", 0.0)),
+                              "percentile": float(row.get("percentile", 0.0)),
+                          }
+              except Exception as exc:
+                  print(f"Warning: EPSS lookup failed for batch: {exc}")
+
+          print(f"Retrieved EPSS scores for {len(epss_map)} / {len(cve_list)} CVEs.")
+
+          # 5. Download full CISA KEV JSON catalog locally and match offline
+          kev_map = {}
+          kev_url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+          try:
+              req = urllib.request.Request(kev_url, headers={"User-Agent": "DevSecOps-Normalizer/1.0"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  kev_payload = json.loads(resp.read().decode("utf-8"))
+                  for vuln in kev_payload.get("vulnerabilities", []):
+                      c_id = vuln.get("cveID", "").upper()
+                      if c_id:
+                          kev_map[c_id] = {
+                              "name": vuln.get("vulnerabilityName", ""),
+                              "dateAdded": vuln.get("dateAdded", ""),
+                              "ransomware": vuln.get("knownRansomwareCampaignUse", "Unknown") == "Known",
+                              "action": vuln.get("requiredAction", ""),
+                          }
+          except Exception as exc:
+              print(f"Warning: CISA KEV catalog download failed: {exc}")
+
+          print(f"Loaded {len(kev_map)} CISA KEV entries locally.")
+
+          # 6. CWE Names & Realistic Security Impact Statements
           cwe_names = {
               20: "Improper Input Validation",
               22: "Path Traversal",
               78: "OS Command Injection",
               79: "Cross-Site Scripting (XSS)",
+              88: "Argument Injection",
               89: "SQL Injection",
               94: "Code Injection",
               116: "Improper Output Encoding / Code Execution",
@@ -209,16 +295,21 @@ jobs:
               352: "Cross-Site Request Forgery (CSRF)",
               362: "Race Condition",
               400: "Uncontrolled Resource Consumption (DoS)",
+              405: "Asymmetric Resource Consumption (Amplification)",
+              407: "Inefficient Algorithmic Complexity",
               415: "Double Free",
               416: "Use After Free",
               476: "NULL Pointer Dereference",
               502: "Deserialization of Untrusted Data",
+              506: "Embedded Malicious Code",
               601: "Open Redirect",
               611: "XML External Entity (XXE)",
+              668: "Exposure of Resource to Wrong Sphere",
               697: "Incorrect Comparison",
               770: "Allocation of Resources Without Limits",
               787: "Out-of-bounds Write",
               798: "Hardcoded Credentials / Secret Exposure",
+              835: "Infinite Loop (DoS)",
               843: "Type Confusion",
               918: "Server-Side Request Forgery (SSRF)",
               943: "NoSQL / Query Injection",
@@ -226,6 +317,37 @@ jobs:
               1321: "Prototype Pollution",
               1333: "Inefficient Regular Expression (ReDoS)",
               1357: "Reliance on Uncontrolled Component / Mutable Tag",
+          }
+
+          cwe_impacts = {
+              20: "Malformed or unexpected user input can bypass validation controls and trigger unintended application behavior.",
+              22: "Attackers can read or overwrite arbitrary files outside the intended directory via path traversal sequences.",
+              78: "Attackers can execute arbitrary operating system commands on the host or container.",
+              79: "Attackers can inject malicious JavaScript into user sessions to steal tokens or perform unauthorized actions.",
+              88: "Untrusted arguments passed to internal functions or commands can alter execution behavior.",
+              89: "Attackers can manipulate SQL queries to read, modify, or delete database records.",
+              94: "Attackers can inject and execute arbitrary application code within the runtime process.",
+              116: "Improperly neutralized input flows into an execution or rendering sink, enabling arbitrary code execution.",
+              200: "Sensitive internal configuration, credentials, or system details may be exposed to unauthorized users.",
+              250: "Processes or workflows run with excessive privileges, increasing blast radius if compromised.",
+              287: "Attackers can bypass authentication checks and impersonate legitimate users.",
+              295: "Improper TLS/certificate validation enables man-in-the-middle interception or spoofing.",
+              319: "Sensitive session cookies or data transmitted without enforced encryption can be intercepted in transit.",
+              330: "Predictable random values weaken cryptographic tokens, session IDs, or security boundaries.",
+              345: "Lack of branch protection or artifact verification allows unreviewed or tampered code into builds.",
+              352: "Attackers can trick authenticated users into executing unwanted state-changing requests.",
+              400: "Crafted inputs can exhaust CPU or memory resources, causing application Denial of Service (DoS).",
+              502: "Untrusted serialized data can trigger arbitrary code execution or logic manipulation during deserialization.",
+              506: "Malicious package code can steal credentials, exfiltrate environment secrets, or backdoor the application.",
+              601: "Attackers can redirect users to malicious external phishing sites via unvalidated redirect targets.",
+              770: "Unbounded resource allocation allows attackers to crash the service or degrade availability.",
+              787: "Out-of-bounds memory writes can corrupt process memory, crash the service, or enable code execution.",
+              798: "Exposed private keys, tokens, or credentials allow unauthorized access or identity spoofing.",
+              918: "Attackers can force the server to send crafted requests to internal services or cloud metadata endpoints.",
+              943: "Crafted query operators can bypass authentication or extract unauthorized database records.",
+              1321: "Attackers can inject properties into Object.prototype, leading to authentication bypass, RCE, or DoS.",
+              1333: "Crafted strings trigger catastrophic regular expression backtracking, freezing the event loop (ReDoS).",
+              1357: "Mutable action tags or unverified external components risk silent supply-chain tampering.",
           }
 
           def infer_cwe(svc, title, existing_cwe):
@@ -245,18 +367,65 @@ jobs:
                       return 798
               return None
 
-          # Track dependency-layer (CVE, package) pairs to deduplicate overlapping container-layer app packages
+          # Track dependency-layer (CVE, normalized_pkg) pairs to deduplicate overlapping container-layer app packages
           dep_cve_pkgs = set()
           for f in findings:
               if (f.get("service") or "") == "dependency-layer":
                   c = (f.get("cve") or "").upper()
-                  comp = (f.get("component_name") or "").lower()
+                  comp = (f.get("component_name") or "").strip().lower()
                   if c and comp:
                       dep_cve_pkgs.add((c, comp))
 
+          def filter_authoritative_refs(existing_refs_str, cve_id, cwe_id, mal_list, svc_name, fpath, lno):
+              clean_links = []
+              seen_urls = set()
+
+              def add_link(label, url):
+                  u = url.strip()
+                  if u and u not in seen_urls:
+                      seen_urls.add(u)
+                      clean_links.append(f"{label}: {u}")
+
+              # Only add GitHub Source link for actual code or IaC/workflow files (never lockfiles or container images)
+              if svc_name in ("code-layer", "iac-cicd-layer") and fpath and "no file" not in fpath.lower() and not fpath.startswith("local-scan:"):
+                  encoded_path = urllib.parse.quote(fpath)
+                  gh_url = f"https://github.com/{github_owner}/{repo_name}/blob/{default_branch}/{encoded_path}"
+                  if lno:
+                      gh_url += f"#L{lno}"
+                  add_link("GitHub Source", gh_url)
+
+              if cve_id:
+                  add_link("NVD Advisory", f"https://nvd.nist.gov/vuln/detail/{cve_id}")
+
+              for mid in mal_list[:2]:
+                  add_link("OSV Malware Advisory", f"https://osv.dev/vulnerability/{mid}")
+
+              # Extract only high-value advisories (GHSA, OSV, Red Hat, Debian, Ubuntu) from existing Trivy/scanner links
+              vendor_added = 0
+              for raw_line in (existing_refs_str or "").splitlines():
+                  for url_match in re.findall(r"https?://[^\s)>]+", raw_line):
+                      u_low = url_match.lower()
+                      if "github.com/advisories/ghsa-" in u_low or "/security/advisories/ghsa-" in u_low:
+                          add_link("GitHub Advisory", url_match)
+                      elif "osv.dev/vulnerability/" in u_low:
+                          add_link("OSV Advisory", url_match)
+                      elif vendor_added < 2 and any(dom in u_low for dom in (
+                          "access.redhat.com/errata/",
+                          "access.redhat.com/security/cve/",
+                          "security-tracker.debian.org/",
+                          "ubuntu.com/security/",
+                      )):
+                          add_link("Vendor Advisory", url_match)
+                          vendor_added += 1
+
+              if cwe_id:
+                  add_link("CWE Definition", f"https://cwe.mitre.org/data/definitions/{cwe_id}.html")
+
+              return "\n".join(clean_links[:6])
+
           updated_count = 0
           deduped_count = 0
-          mal_flagged_count = 0
+          mal_flagged_count = len(lockfile_mal_findings)
 
           for f in findings:
               fid = f["id"]
@@ -266,6 +435,8 @@ jobs:
 
               raw_title = (f.get("title") or "").strip()
               desc = f.get("description") or ""
+              raw_mitigation = (f.get("mitigation") or "").strip()
+              raw_impact = (f.get("impact") or "").strip()
               file_path = (f.get("file_path") or "").lstrip("/")
               line_no = f.get("line")
               comp_name = (f.get("component_name") or "").strip()
@@ -294,7 +465,7 @@ jobs:
                       if (cve, comp_name.lower()) in dep_cve_pkgs:
                           is_cross_layer_dup = True
 
-              # Build clean, non-repetitive human-readable title
+              # Clean title generation
               short_file = os.path.basename(file_path) if file_path and "no file" not in file_path.lower() else ""
               loc_suffix = f"{short_file}:{line_no}" if (short_file and line_no) else short_file
 
@@ -324,25 +495,26 @@ jobs:
 
               clean_title = clean_title[:490]
 
-              # Build clickable references (GitHub source line link + NVD + OSV + CWE)
-              ref_links = []
-              if file_path and "no file" not in file_path.lower() and not file_path.startswith("local-scan:"):
-                  encoded_path = urllib.parse.quote(file_path)
-                  gh_url = f"https://github.com/{github_owner}/{repo_name}/blob/{default_branch}/{encoded_path}"
-                  if line_no:
-                      gh_url += f"#L{line_no}"
-                  ref_links.append(f"GitHub Source: {gh_url}")
-              if cve:
-                  ref_links.append(f"NVD Advisory: https://nvd.nist.gov/vuln/detail/{cve}")
-              for mid in mal_ids[:3]:
-                  ref_links.append(f"OSV Malware Advisory: https://osv.dev/vulnerability/{mid}")
-              if cwe:
-                  ref_links.append(f"CWE Definition: https://cwe.mitre.org/data/definitions/{cwe}.html")
+              # Fix Trivy's 'fixed' Impact placeholder and bare version Mitigation string
+              clean_impact = raw_impact
+              if not clean_impact or clean_impact.lower() in ("fixed", "affected", "under_investigation", "will_not_fix"):
+                  if cwe in cwe_impacts:
+                      clean_impact = cwe_impacts[cwe]
+                  elif svc in ("dependency-layer", "container-layer") and comp_name:
+                      clean_impact = f"Vulnerable component '{comp_name}' may expose the application or runtime environment to exploitation."
+                  elif svc == "governance-posture":
+                      clean_impact = "Weak repository or CI/CD governance controls increase the risk of unauthorized changes or supply-chain tampering."
 
-              existing_refs = (f.get("references") or "").strip()
-              merged_refs = "\n".join(ref_links)
-              if existing_refs and "GitHub Source:" not in existing_refs:
-                  merged_refs = f"{merged_refs}\n{existing_refs}".strip()
+              clean_mitigation = raw_mitigation
+              if svc in ("dependency-layer", "container-layer") and comp_name:
+                  if clean_mitigation and len(clean_mitigation) < 40 and not clean_mitigation.lower().startswith("upgrade"):
+                      clean_mitigation = f"Upgrade '{comp_name}' to fixed version {clean_mitigation} (or later) and rebuild dependencies."
+                  elif not clean_mitigation:
+                      clean_mitigation = f"Check upstream advisories for '{comp_name}' and upgrade to a patched release or replace the unmaintained package."
+
+              merged_refs = filter_authoritative_refs(
+                  f.get("references") or "", cve, cwe, mal_ids, svc, file_path, line_no
+              )
 
               patch_data = {
                   "title": clean_title,
@@ -352,6 +524,10 @@ jobs:
               }
               if cwe:
                   patch_data["cwe"] = cwe
+              if clean_impact:
+                  patch_data["impact"] = clean_impact
+              if clean_mitigation:
+                  patch_data["mitigation"] = clean_mitigation
 
               banner_notes = []
               if mal_hits:
@@ -411,3 +587,19 @@ jobs:
 
           print(f"Offline normalization complete: {updated_count} findings enriched, {mal_flagged_count} malicious packages flagged, {deduped_count} cross-layer duplicates closed.")
           EOF
+
+      - name: Import Offline OSV Malware Detections to DefectDojo (If Any Found)
+        if: hashFiles('osv-malware-import.json') != ''
+        run: |
+          curl -i --fail-with-body -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=Generic Findings Import" \
+            -F "test_title=OSV Offline Supply-Chain Malware Check" \
+            -F "service=dependency-layer" \
+            -F "tags=sca,osv-malicious-package,supply-chain-malware" \
+            -F "file=@osv-malware-import.json" \
+            -F "product_name=node-goat" \
+            -F "product_type_name=GitHub Repositories" \
+            -F "engagement_name=Scheduled CI Scans" \
+            -F "auto_create_context=true" \
+            -F "close_old_findings=true"
