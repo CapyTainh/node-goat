@@ -8,13 +8,13 @@ on:
 
 jobs:
   normalize-findings:
-    name: Normalize Titles, Impact, Advisories, EPSS, KEV & Offline OSV (node-goat)
+    name: Normalize Titles, Justification, SCA Reachability, EPSS, KEV & OSV (node-goat)
     if: github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Checkout Repository (for Offline Lockfile Malware Check)
+      - name: Checkout Repository (for Offline Lockfile & Source Reachability Check)
         uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -63,7 +63,103 @@ jobs:
 
           print(f"Fetched {len(findings)} active findings for {repo_name}.")
 
-          # 2. Zero-Leak OSV Malware Matching (Download public ecosystem ZIPs & match 100% locally)
+          # 2. Build local repository context for SCA false-positive & reachability triage
+          direct_prod_pkgs = set()
+          direct_dev_pkgs = set()
+          lock_dev_pkgs = set()
+          lockfile_packages = []  # (eco, pkg_name, pkg_ver, lockfile_path)
+          ecosystems_needed = set()
+
+          # Index first-party source files to detect whether a dependency is imported directly
+          source_code_files = []  # (rel_path, content_lower)
+          code_exts = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".php", ".go", ".java", ".rb")
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "vendor", ".venv", "dist", "build")]
+              for fname in files:
+                  rel_path = os.path.relpath(os.path.join(root, fname), ".").replace("\\", "/")
+                  if fname == "package.json":
+                      try:
+                          with open(rel_path, "r", encoding="utf-8", errors="ignore") as pf:
+                              pdata = json.load(pf)
+                          for d in (pdata.get("dependencies") or {}).keys():
+                              direct_prod_pkgs.add(d.lower())
+                          for d in (pdata.get("devDependencies") or {}).keys():
+                              direct_dev_pkgs.add(d.lower())
+                      except Exception:
+                          pass
+                  elif fname == "package-lock.json":
+                      ecosystems_needed.add("npm")
+                      try:
+                          with open(rel_path, "r", encoding="utf-8", errors="ignore") as lf:
+                              lock_data = json.load(lf)
+                          for pkg_path, meta in (lock_data.get("packages") or {}).items():
+                              if not pkg_path:
+                                  continue
+                              pname = pkg_path.split("node_modules/")[-1]
+                              pver = meta.get("version", "")
+                              if meta.get("dev") is True:
+                                  lock_dev_pkgs.add(pname.lower())
+                              if pname and pver:
+                                  lockfile_packages.append(("npm", pname, pver, rel_path))
+                          def walk_v1_deps(deps_dict):
+                              for dname, dmeta in (deps_dict or {}).items():
+                                  dver = dmeta.get("version", "")
+                                  if dmeta.get("dev") is True:
+                                      lock_dev_pkgs.add(dname.lower())
+                                  if dname and dver:
+                                      lockfile_packages.append(("npm", dname, dver, rel_path))
+                                  if "dependencies" in dmeta:
+                                      walk_v1_deps(dmeta["dependencies"])
+                          walk_v1_deps(lock_data.get("dependencies"))
+                      except Exception:
+                          pass
+                  elif fname == "composer.lock":
+                      ecosystems_needed.add("Packagist")
+                      try:
+                          with open(rel_path, "r", encoding="utf-8", errors="ignore") as lf:
+                              cdata = json.load(lf)
+                          for pkg in (cdata.get("packages") or []):
+                              pname = pkg.get("name", "")
+                              pver = (pkg.get("version") or "").lstrip("v")
+                              if pname:
+                                  direct_prod_pkgs.add(pname.lower())
+                              if pname and pver:
+                                  lockfile_packages.append(("Packagist", pname, pver, rel_path))
+                          for pkg in (cdata.get("packages-dev") or []):
+                              pname = pkg.get("name", "")
+                              pver = (pkg.get("version") or "").lstrip("v")
+                              if pname:
+                                  direct_dev_pkgs.add(pname.lower())
+                                  lock_dev_pkgs.add(pname.lower())
+                              if pname and pver:
+                                  lockfile_packages.append(("Packagist", pname, pver, rel_path))
+                      except Exception:
+                          pass
+                  elif fname == "requirements.txt":
+                      ecosystems_needed.add("PyPI")
+                  elif fname.lower().endswith(code_exts):
+                      try:
+                          if os.path.getsize(rel_path) <= 512_000:
+                              with open(rel_path, "r", encoding="utf-8", errors="ignore") as cf:
+                                  source_code_files.append((rel_path, cf.read().lower()))
+                      except Exception:
+                          pass
+
+          def find_source_imports(pkg_name):
+              if not pkg_name:
+                  return []
+              p_esc = re.escape(pkg_name.lower())
+              imp_re = re.compile(rf"(?:require\s*\(\s*['\"]|from\s+['\"]|import\s+['\"]){p_esc}(?:['\"/])")
+              hits = []
+              for spath, content in source_code_files:
+                  if imp_re.search(content):
+                      hits.append(spath)
+                      if len(hits) >= 4:
+                          break
+              return hits
+
+          # 3. Zero-Leak OSV Malware Matching (Download public ecosystem ZIPs & match 100% locally)
           def infer_osv_ecosystem(tags_list, file_path):
               tset = {t.lower() for t in tags_list}
               fp = file_path.lower()
@@ -81,57 +177,11 @@ jobs:
                   return "crates.io"
               return None
 
-          ecosystems_needed = set()
           for f in findings:
               if (f.get("service") or "") in ("dependency-layer", "container-layer"):
                   eco = infer_osv_ecosystem(f.get("tags") or [], f.get("file_path") or "")
                   if eco:
                       ecosystems_needed.add(eco)
-
-          # Also detect ecosystems directly from repository lockfiles so zero-CVE MAL-* packages are caught
-          lockfile_packages = []  # list of (eco, pkg_name, pkg_ver, lockfile_path)
-          for root, dirs, files in os.walk("."):
-              dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "vendor", ".venv")]
-              for fname in files:
-                  rel_path = os.path.relpath(os.path.join(root, fname), ".").replace("\\", "/")
-                  if fname == "package-lock.json":
-                      ecosystems_needed.add("npm")
-                      try:
-                          with open(rel_path, "r", encoding="utf-8", errors="ignore") as lf:
-                              lock_data = json.load(lf)
-                          # npm lockfile v2/v3 'packages'
-                          for pkg_path, meta in (lock_data.get("packages") or {}).items():
-                              if not pkg_path:
-                                  continue
-                              pname = pkg_path.split("node_modules/")[-1]
-                              pver = meta.get("version", "")
-                              if pname and pver:
-                                  lockfile_packages.append(("npm", pname, pver, rel_path))
-                          # npm lockfile v1 'dependencies'
-                          def walk_v1_deps(deps_dict):
-                              for dname, dmeta in (deps_dict or {}).items():
-                                  dver = dmeta.get("version", "")
-                                  if dname and dver:
-                                      lockfile_packages.append(("npm", dname, dver, rel_path))
-                                  if "dependencies" in dmeta:
-                                      walk_v1_deps(dmeta["dependencies"])
-                          walk_v1_deps(lock_data.get("dependencies"))
-                      except Exception:
-                          pass
-                  elif fname == "composer.lock":
-                      ecosystems_needed.add("Packagist")
-                      try:
-                          with open(rel_path, "r", encoding="utf-8", errors="ignore") as lf:
-                              cdata = json.load(lf)
-                          for pkg in (cdata.get("packages") or []) + (cdata.get("packages-dev") or []):
-                              pname = pkg.get("name", "")
-                              pver = (pkg.get("version") or "").lstrip("v")
-                              if pname and pver:
-                                  lockfile_packages.append(("Packagist", pname, pver, rel_path))
-                      except Exception:
-                          pass
-                  elif fname == "requirements.txt":
-                      ecosystems_needed.add("PyPI")
 
           local_mal_index = {}
           for eco in sorted(ecosystems_needed):
@@ -198,6 +248,10 @@ jobs:
                           f"Detected offline in `{lpath}` ({eco} ecosystem)."
                       ),
                       "severity": "Critical",
+                      "severity_justification": (
+                          f"P0 Immediate Blocker: Package '{pname}@{pver}' matches confirmed OpenSSF/OSV supply-chain malware "
+                          f"({', '.join(mal_ids)}). Intentional malware executes during install or runtime regardless of CVE status."
+                      ),
                       "cwe": 506,
                       "mitigation": f"Remove malicious package '{pname}@{pver}' immediately, rotate any secrets/tokens exposed on build or runtime hosts, and audit lockfile history.",
                       "impact": "Embedded malicious code can exfiltrate credentials, environment variables, or establish unauthorized remote access.",
@@ -211,6 +265,7 @@ jobs:
                       "tags": ["sca", "osv-malicious-package", "supply-chain-malware", "normalized"]
                   })
 
+          print(f"Scanned {len(lockfile_packages)} lockfile package entries offline against OSV malware index.")
           if lockfile_mal_findings:
               print(f"ALERT: Found {len(lockfile_mal_findings)} malicious package(s) in repository lockfiles! Importing to DefectDojo...")
               with open("osv-malware-import.json", "w", encoding="utf-8") as mf:
@@ -219,7 +274,7 @@ jobs:
           if not findings:
               raise SystemExit(0)
 
-          # 3. Collect all unique CVEs across findings
+          # 4. Collect all unique CVEs across findings
           cve_pattern = re.compile(r"CVE-[0-9]{4}-[0-9]{4,19}", re.IGNORECASE)
           all_cves = set()
           for f in findings:
@@ -228,7 +283,7 @@ jobs:
               for match in cve_pattern.findall(f.get("title") or ""):
                   all_cves.add(match.upper())
 
-          # 4. Query FIRST EPSS API in batches of 50 public CVE IDs
+          # 5. Query FIRST EPSS API in batches of 50 public CVE IDs
           epss_map = {}
           cve_list = sorted(all_cves)
           for i in range(0, len(cve_list), 50):
@@ -249,7 +304,7 @@ jobs:
 
           print(f"Retrieved EPSS scores for {len(epss_map)} / {len(cve_list)} CVEs.")
 
-          # 5. Download full CISA KEV JSON catalog locally and match offline
+          # 6. Download full CISA KEV JSON catalog locally and match offline
           kev_map = {}
           kev_url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
           try:
@@ -270,7 +325,7 @@ jobs:
 
           print(f"Loaded {len(kev_map)} CISA KEV entries locally.")
 
-          # 6. CWE Names & Realistic Security Impact Statements
+          # 7. CWE Names & Realistic Security Impact Statements
           cwe_names = {
               20: "Improper Input Validation",
               22: "Path Traversal",
@@ -386,7 +441,6 @@ jobs:
                       seen_urls.add(u)
                       clean_links.append(f"{label}: {u}")
 
-              # Only add GitHub Source link for actual code or IaC/workflow files (never lockfiles or container images)
               if svc_name in ("code-layer", "iac-cicd-layer") and fpath and "no file" not in fpath.lower() and not fpath.startswith("local-scan:"):
                   encoded_path = urllib.parse.quote(fpath)
                   gh_url = f"https://github.com/{github_owner}/{repo_name}/blob/{default_branch}/{encoded_path}"
@@ -400,7 +454,6 @@ jobs:
               for mid in mal_list[:2]:
                   add_link("OSV Malware Advisory", f"https://osv.dev/vulnerability/{mid}")
 
-              # Extract only high-value advisories (GHSA, OSV, Red Hat, Debian, Ubuntu) from existing Trivy/scanner links
               vendor_added = 0
               for raw_line in (existing_refs_str or "").splitlines():
                   for url_match in re.findall(r"https?://[^\s)>]+", raw_line):
@@ -437,12 +490,14 @@ jobs:
               desc = f.get("description") or ""
               raw_mitigation = (f.get("mitigation") or "").strip()
               raw_impact = (f.get("impact") or "").strip()
+              raw_steps = (f.get("steps_to_reproduce") or "").strip()
               file_path = (f.get("file_path") or "").lstrip("/")
               line_no = f.get("line")
               comp_name = (f.get("component_name") or "").strip()
               comp_ver = (f.get("component_version") or "").strip()
               existing_cwe = f.get("cwe")
               tags = list(f.get("tags") or [])
+              sev = f.get("severity", "Medium")
 
               cve = (f.get("cve") or "").upper()
               if not cve:
@@ -457,7 +512,7 @@ jobs:
               mal_hits = match_local_malware(eco, comp_name, comp_ver)
               mal_ids = [h["id"] for h in mal_hits]
 
-              # Cross-layer deduplication: close container-layer app packages already covered in dependency-layer
+              # Cross-layer deduplication
               is_cross_layer_dup = False
               if svc == "container-layer" and cve and comp_name:
                   fp_low = file_path.lower()
@@ -465,7 +520,7 @@ jobs:
                       if (cve, comp_name.lower()) in dep_cve_pkgs:
                           is_cross_layer_dup = True
 
-              # Clean title generation
+              # Idempotent clean title generation (strip previous prefixes/suffixes first so re-runs never double-prefix)
               short_file = os.path.basename(file_path) if file_path and "no file" not in file_path.lower() else ""
               loc_suffix = f"{short_file}:{line_no}" if (short_file and line_no) else short_file
 
@@ -478,18 +533,28 @@ jobs:
                   w_part = weakness_label or (kev_map[cve]["name"] if cve in kev_map else "Known Vulnerability")
                   clean_title = f"[{layer_prefix}: {pkg_str}] {w_part} ({cve})"
               elif svc == "dependency-layer" and ("secret" in raw_title.lower() or cwe == 798):
-                  clean_title = f"[Exposed Secret] {raw_title} ({loc_suffix or file_path})"
+                  base_secret = re.sub(r"^(\[Exposed Secret\]\s*)+", "", raw_title, flags=re.IGNORECASE)
+                  if loc_suffix and base_secret.endswith(f"({loc_suffix})"):
+                      base_secret = base_secret[:-(len(loc_suffix) + 3)].strip()
+                  clean_title = f"[Exposed Secret] {base_secret} ({loc_suffix or file_path})"
               elif svc == "code-layer":
-                  cleaned = re.sub(r"\[([^]]+)\]\([0-9]+\)", r"\1", raw_title).rstrip(".")
+                  cleaned = re.sub(r"^(\[SAST\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
+                  if loc_suffix and cleaned.endswith(f"({loc_suffix})"):
+                      cleaned = cleaned[:-(len(loc_suffix) + 3)].strip()
+                  cleaned = re.sub(r"\[([^]]+)\]\([0-9]+\)", r"\1", cleaned).rstrip(".")
                   if "." in cleaned and " " not in cleaned:
                       cleaned = cleaned.split(".")[-1].replace("-", " ").title()
                   clean_title = f"[SAST] {cleaned} ({loc_suffix})" if loc_suffix else f"[SAST] {cleaned}"
               elif svc == "iac-cicd-layer":
-                  clean_title = f"[IaC / CI-CD] {raw_title} ({loc_suffix})" if loc_suffix else f"[IaC / CI-CD] {raw_title}"
+                  cleaned_iac = re.sub(r"^(\[IaC / CI-CD\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
+                  if loc_suffix and cleaned_iac.endswith(f"({loc_suffix})"):
+                      cleaned_iac = cleaned_iac[:-(len(loc_suffix) + 3)].strip()
+                  clean_title = f"[IaC / CI-CD] {cleaned_iac} ({loc_suffix})" if loc_suffix else f"[IaC / CI-CD] {cleaned_iac}"
               elif svc == "governance-posture":
-                  short_sc = raw_title.split("Remediation Tip:")[0].split("Warn:")[0].strip().rstrip(":")
+                  cleaned_sc = re.sub(r"^(\[Supply Chain Posture\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
+                  short_sc = cleaned_sc.split("Remediation Tip:")[0].split("Warn:")[0].strip().rstrip(":")
                   short_sc = re.sub(r"^Score Is [0-9]+:\s*", "", short_sc, flags=re.IGNORECASE)
-                  clean_title = f"[Supply Chain Posture] {short_sc}" + (f" ({short_file})" if short_file else "")
+                  clean_title = f"[Supply Chain Posture] {short_sc}" + (f" ({short_file})" if short_file and not short_sc.endswith(f"({short_file})") else "")
               else:
                   clean_title = raw_title
 
@@ -516,9 +581,92 @@ jobs:
                   f.get("references") or "", cve, cwe, mal_ids, svc, file_path, line_no
               )
 
+              # Build clear Severity Justification explaining EPSS, Percentile, KEV, OSV & Priority Tier
+              epss_val = epss_map[cve]["epss"] if (cve and cve in epss_map) else None
+              pct_val = epss_map[cve]["percentile"] if (cve and cve in epss_map) else None
+              kev_info = kev_map.get(cve) if cve else None
+              has_public_advisory = bool(cve or mal_hits)
+
+              if mal_hits or kev_info:
+                  tier_label = "P0 — Immediate Blocker (24-48h SLA)"
+              elif epss_val is not None and (epss_val >= 0.10 or (sev in ("Critical", "High") and epss_val >= 0.04)):
+                  tier_label = "P1 — Urgent Remediation (7-day SLA)"
+              elif svc == "code-layer" and sev in ("Critical", "High"):
+                  tier_label = "P1 — Urgent Code Fix (Pending DAST/Pentest Reachability Confirmation)"
+              elif epss_val is not None and epss_val >= 0.01:
+                  tier_label = "P2 — Scheduled Sprint Remediation (30-day SLA)"
+              else:
+                  tier_label = "P3 — Standard Backlog / Low Active Exploitation Likelihood"
+
+              just_lines = [f"Priority Tier: {tier_label} (Scanner Severity: {sev})."]
+              if mal_hits:
+                  just_lines.append(f"- OSV Supply-Chain Malware: CONFIRMED ({', '.join(mal_ids)}). Intentional malicious code.")
+              if kev_info:
+                  just_lines.append(
+                      f"- CISA KEV Status: CONFIRMED EXPLOITED IN THE WILD (Added {kev_info['dateAdded']}; "
+                      f"Ransomware Campaign Use: {'Yes' if kev_info['ransomware'] else 'Unknown'})."
+                  )
+              elif cve:
+                  just_lines.append("- CISA KEV Status: Not currently listed in CISA Known Exploited Vulnerabilities.")
+
+              if epss_val is not None:
+                  just_lines.append(
+                      f"- FIRST EPSS Score: {epss_val * 100:.2f}% probability of exploitation within 30 days "
+                      f"(Percentile: {pct_val * 100:.1f}% — higher risk than {pct_val * 100:.1f}% of all scored CVEs)."
+                  )
+              elif not cve:
+                  just_lines.append("- FIRST EPSS Score: N/A (Code/configuration weakness without a CVE; evaluated via CWE impact and runtime reachability).")
+
+              if cve:
+                  just_lines.append(f"- Public Advisory / Exploit Tracking: Tracked under {cve} (see NVD/GHSA links in References).")
+
+              severity_justification = "\n".join(just_lines)
+
+              # Build SCA False-Positive & Reachability Triage Guide in Steps To Reproduce
+              steps_out = raw_steps
+              if svc == "dependency-layer" and comp_name:
+                  p_low = comp_name.lower()
+                  is_dev = (p_low in direct_dev_pkgs or p_low in lock_dev_pkgs) and (p_low not in direct_prod_pkgs)
+                  is_direct = (p_low in direct_prod_pkgs) or (p_low in direct_dev_pkgs)
+                  import_hits = find_source_imports(comp_name)
+
+                  scope_str = "Dev/Build-Only Dependency (devDependencies — does NOT ship in production runtime)" if is_dev else "Runtime / Production Dependency"
+                  rel_str = "Direct Dependency (declared in package.json / lockfile root)" if is_direct else "Transitive Dependency (pulled in indirectly by another package)"
+
+                  if is_dev and "dev-only-dependency" not in tags:
+                      tags.append("dev-only-dependency")
+                  if not is_direct and "transitive-dependency" not in tags:
+                      tags.append("transitive-dependency")
+
+                  if import_hits:
+                      reach_str = f"Directly imported in first-party source files: {', '.join(import_hits)}. Verify whether user-controlled input reaches the vulnerable function."
+                      if "direct-import" not in tags:
+                          tags.append("direct-import")
+                  else:
+                      reach_str = (
+                          f"No direct 'require/import' of '{comp_name}' found in first-party source code. "
+                          "Likely a transitive sub-dependency—check whether the parent library actually invokes the vulnerable function in your runtime paths."
+                      )
+                      if "unreferenced-in-source" not in tags:
+                          tags.append("unreferenced-in-source")
+
+                  triage_guide = (
+                      f"**Automated SCA Reachability & False-Positive Check:**\n"
+                      f"- **Dependency Scope:** {scope_str}\n"
+                      f"- **Dependency Depth:** {rel_str}\n"
+                      f"- **Source Code Reachability:** {reach_str}\n\n"
+                      f"**How Developers Verify If This Is a False Positive:**\n"
+                      f"1. Run `npm ls {comp_name}` (or check lockfile tree) to see which top-level package pulls in `{comp_name}@{comp_ver}`.\n"
+                      f"2. Check the vulnerability description for the specific affected function (e.g., `expand()`, `template()`, or prototype merge).\n"
+                      f"3. If `{comp_name}` is dev-only or the vulnerable function is never executed with untrusted input in your environment, mark as **False Positive / Risk Accepted** in DefectDojo with justification; otherwise upgrade to the fixed version."
+                  )
+                  if not steps_out or "**Automated SCA Reachability & False-Positive Check:**" in steps_out:
+                      steps_out = triage_guide
+
               patch_data = {
                   "title": clean_title,
                   "references": merged_refs,
+                  "severity_justification": severity_justification,
                   "known_exploited": bool(f.get("known_exploited", False)),
                   "ransomware_used": bool(f.get("ransomware_used", False)),
               }
@@ -528,6 +676,8 @@ jobs:
                   patch_data["impact"] = clean_impact
               if clean_mitigation:
                   patch_data["mitigation"] = clean_mitigation
+              if steps_out:
+                  patch_data["steps_to_reproduce"] = steps_out
 
               banner_notes = []
               if mal_hits:
@@ -541,17 +691,14 @@ jobs:
                       f"**[OSV MALICIOUS PACKAGE DETECTED: {', '.join(mal_ids)}]** {mal_summary}"
                   )
 
-              if cve and cve in epss_map:
-                  epss_val = epss_map[cve]["epss"]
-                  pct_val = epss_map[cve]["percentile"]
+              if epss_val is not None:
                   patch_data["epss_score"] = round(epss_val, 5)
                   patch_data["epss_percentile"] = round(pct_val, 5)
                   if epss_val >= 0.10 and "high-epss" not in tags:
                       tags.append("high-epss")
                   banner_notes.append(f"**EPSS Exploit Probability:** {epss_val * 100:.2f}% (Percentile: {pct_val * 100:.1f}%)")
 
-              if cve and cve in kev_map:
-                  kev_info = kev_map[cve]
+              if kev_info:
                   patch_data["known_exploited"] = True
                   patch_data["ransomware_used"] = kev_info["ransomware"]
                   if kev_info["dateAdded"]:
