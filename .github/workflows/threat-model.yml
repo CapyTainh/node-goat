@@ -1,7 +1,7 @@
 name: Threat Model Sync & Risk Analysis (Hybrid STRIDE)
 on:
   workflow_run:
-    workflows: ["Scheduled Security Scan (SAST, Trivy, Checkov, Scorecard & DefectDojo)"]
+    workflows: ["Normalize & Enrich DefectDojo Findings (EPSS, KEV & Links)"]
     types:
       - completed
   push:
