@@ -228,7 +228,6 @@ jobs:
                       hits.append(entry)
               return hits
 
-          # Scan full lockfile inventory offline for zero-CVE malicious packages
           seen_lock_hits = set()
           lockfile_mal_findings = []
           for eco, pname, pver, lpath in lockfile_packages:
@@ -275,6 +274,7 @@ jobs:
 
           # 4. Collect all unique CVEs across findings
           cve_pattern = re.compile(r"CVE-[0-9]{4}-[0-9]{4,19}", re.IGNORECASE)
+          adv_id_pattern = re.compile(r"^(?:CVE-[0-9]{4}-[0-9]{4,19}|GHSA-[a-z0-9-]+|NSWG-ECO-[0-9]+|PYSEC-[0-9-]+|RUSTSEC-[0-9-]+|GO-[0-9-]+)\b", re.IGNORECASE)
           all_cves = set()
           for f in findings:
               if f.get("cve"):
@@ -324,7 +324,7 @@ jobs:
 
           print(f"Loaded {len(kev_map)} CISA KEV entries locally.")
 
-          # 7. CWE Names & Realistic Security Impact Statements
+          # 7. Expanded CWE Names & Realistic Security Impact Statements
           cwe_names = {
               20: "Improper Input Validation",
               22: "Path Traversal",
@@ -338,14 +338,19 @@ jobs:
               190: "Integer Overflow",
               200: "Sensitive Information Exposure",
               250: "Execution with Unnecessary Privileges",
+              285: "Improper Authorization",
               287: "Improper Authentication",
               290: "Authentication Bypass by Spoofing",
               295: "Improper Certificate Validation",
               306: "Missing Authentication for Critical Function",
               319: "Cleartext Transmission of Sensitive Information",
+              326: "Inadequate Encryption Strength",
               327: "Broken or Risky Cryptographic Algorithm",
+              328: "Use of Weak Hash",
               330: "Insufficiently Random Values",
+              331: "Insufficient Entropy",
               345: "Insufficient Verification of Data Authenticity",
+              347: "Improper Verification of Cryptographic Signature",
               352: "Cross-Site Request Forgery (CSRF)",
               362: "Race Condition",
               400: "Uncontrolled Resource Consumption (DoS)",
@@ -365,6 +370,7 @@ jobs:
               798: "Hardcoded Credentials / Secret Exposure",
               835: "Infinite Loop (DoS)",
               843: "Type Confusion",
+              916: "Use of Password Hash With Insufficient Computational Effort",
               918: "Server-Side Request Forgery (SSRF)",
               943: "NoSQL / Query Injection",
               1050: "Excessive Platform Resource Consumption",
@@ -384,11 +390,16 @@ jobs:
               116: "Improperly neutralized input flows into an execution or rendering sink, enabling arbitrary code execution.",
               200: "Sensitive internal configuration, credentials, or system details may be exposed to unauthorized users.",
               250: "Processes or workflows run with excessive privileges, increasing blast radius if compromised.",
+              285: "Missing or flawed authorization checks allow authenticated users to access restricted resources.",
               287: "Attackers can bypass authentication checks and impersonate legitimate users.",
               295: "Improper TLS/certificate validation enables man-in-the-middle interception or spoofing.",
               319: "Sensitive session cookies or data transmitted without enforced encryption can be intercepted in transit.",
+              327: "Broken cryptographic algorithms allow attackers to forge tokens, bypass signatures, or decrypt sensitive data.",
+              328: "Weak cryptographic hashes are vulnerable to collision or brute-force attacks.",
               330: "Predictable random values weaken cryptographic tokens, session IDs, or security boundaries.",
+              331: "Insufficient randomness makes keys, salts, or tokens predictable to attackers.",
               345: "Lack of branch protection or artifact verification allows unreviewed or tampered code into builds.",
+              347: "Improper signature verification allows attackers to forge JWTs or signed payloads.",
               352: "Attackers can trick authenticated users into executing unwanted state-changing requests.",
               400: "Crafted inputs can exhaust CPU or memory resources, causing application Denial of Service (DoS).",
               502: "Untrusted serialized data can trigger arbitrary code execution or logic manipulation during deserialization.",
@@ -397,6 +408,7 @@ jobs:
               770: "Unbounded resource allocation allows attackers to crash the service or degrade availability.",
               787: "Out-of-bounds memory writes can corrupt process memory, crash the service, or enable code execution.",
               798: "Exposed private keys, tokens, or credentials allow unauthorized access or identity spoofing.",
+              916: "Weak password-hashing iteration counts make credentials fast to crack offline.",
               918: "Attackers can force the server to send crafted requests to internal services or cloud metadata endpoints.",
               943: "Crafted query operators can bypass authentication or extract unauthorized database records.",
               1321: "Attackers can inject properties into Object.prototype, leading to authentication bypass, RCE, or DoS.",
@@ -404,32 +416,54 @@ jobs:
               1357: "Mutable action tags or unverified external components risk silent supply-chain tampering.",
           }
 
+          def extract_summary_from_desc(desc_text, pkg_name):
+              for raw_line in (desc_text or "").splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("**EPSS") or line.startswith("**[CISA") or line.startswith("**[OSV"):
+                      continue
+                  if line.lower().startswith(("target:", "type:", "fixed version:", "installed version:", "vulnerability id:")):
+                      continue
+                  # Strip leading 'nodejs-pkg:' or 'pkg:' prefix from Trivy summary lines
+                  if ":" in line:
+                      prefix, rest = line.split(":", 1)
+                      if len(prefix) < 40 and rest.strip():
+                          line = rest.strip()
+                  if pkg_name and line.lower().startswith(pkg_name.lower() + " "):
+                      line = line[len(pkg_name):].strip(" :-")
+                  if len(line) >= 6:
+                      # Capitalize first letter cleanly
+                      return (line[0].upper() + line[1:])[:90].rstrip(".")
+              return ""
+
           def infer_cwe(svc, title, existing_cwe):
               if existing_cwe:
                   return existing_cwe
               t = title.lower()
-              if svc == "dependency-layer" and ("secret" in t or "key" in t or "token" in t or "password" in t):
+              if "secret" in t or "private key" in t or "high entropy" in t or "token" in t or "password" in t:
                   return 798
-              if svc in ("iac-cicd-layer", "governance-posture"):
+              if svc == "governance-posture":
                   if "root" in t or "privilege" in t or "write-all" in t or "permission" in t:
                       return 250
                   if "pin" in t or "hash" in t or "mutable" in t:
                       return 1357
                   if "branch" in t or "review" in t or "signed" in t:
                       return 345
-                  if "curl" in t or "secret" in t:
-                      return 798
               return None
 
+          # Track dependency-layer (CVE/Advisory, pkg) and secret file paths so container-layer duplicates can be closed
           dep_cve_pkgs = set()
+          dep_secret_basenames = set()
           for f in findings:
               if (f.get("service") or "") == "dependency-layer":
                   c = (f.get("cve") or "").upper()
                   comp = (f.get("component_name") or "").strip().lower()
                   if c and comp:
                       dep_cve_pkgs.add((c, comp))
+                  fp = (f.get("file_path") or "").strip().lower()
+                  if fp and ("secret" in (f.get("title") or "").lower() or f.get("cwe") == 798):
+                      dep_secret_basenames.add(os.path.basename(fp))
 
-          def filter_authoritative_refs(existing_refs_str, cve_id, cwe_id, mal_list, svc_name, fpath, lno):
+          def filter_authoritative_refs(existing_refs_str, cve_id, cwe_id, mal_list, svc_name, fpath, lno, is_secret):
               clean_links = []
               seen_urls = set()
 
@@ -439,8 +473,9 @@ jobs:
                       seen_urls.add(u)
                       clean_links.append(f"{label}: {u}")
 
-              if svc_name in ("code-layer", "iac-cicd-layer") and fpath and "no file" not in fpath.lower() and not fpath.startswith("local-scan:"):
-                  encoded_path = urllib.parse.quote(fpath)
+              if (svc_name in ("code-layer", "iac-cicd-layer") or is_secret) and fpath and "no file" not in fpath.lower() and not fpath.startswith("local-scan:"):
+                  clean_fp = re.sub(rf"^{re.escape(repo_name)}/", "", fpath, flags=re.IGNORECASE)
+                  encoded_path = urllib.parse.quote(clean_fp)
                   gh_url = f"https://github.com/{github_owner}/{repo_name}/blob/{default_branch}/{encoded_path}"
                   if lno:
                       gh_url += f"#L{lno}"
@@ -478,16 +513,19 @@ jobs:
               raw_set = {t.lower() for t in existing_tags}
               clean_set = set()
 
-              # Keep any manual human-in-the-loop priority overrides
               for manual_tag in ("priority-confirmed", "p0", "p1", "p2", "p3"):
                   if manual_tag in raw_set:
                       clean_set.add(manual_tag)
 
-              # Core category tags
-              if svc_name == "code-layer":
+              # If a finding is a secret (even if detected inside container-layer or Checkov CKV_SECRET_*), tag as 'secrets'
+              if is_secret:
+                  clean_set.add("secrets")
+                  if svc_name == "iac-cicd-layer":
+                      clean_set.add("iac")
+              elif svc_name == "code-layer":
                   clean_set.add("sast")
               elif svc_name == "dependency-layer":
-                  clean_set.add("secrets" if is_secret else "sca")
+                  clean_set.add("sca")
               elif svc_name == "container-layer":
                   clean_set.add("container")
               elif svc_name == "iac-cicd-layer":
@@ -497,14 +535,13 @@ jobs:
                   clean_set.add("cicd")
                   clean_set.add("scorecard")
 
-              # Package / OS ecosystem tag (e.g., npm, pypi, packagist, alpine, debian)
-              if eco_name:
+              if eco_name and not is_secret:
                   clean_set.add(eco_name.lower())
-              for os_tag in ("alpine", "debian", "ubuntu", "redhat", "maven", "go", "cargo"):
-                  if os_tag in raw_set:
-                      clean_set.add(os_tag)
+              if not is_secret:
+                  for os_tag in ("alpine", "debian", "ubuntu", "redhat", "maven", "go", "cargo"):
+                      if os_tag in raw_set:
+                          clean_set.add(os_tag)
 
-              # High-signal threat intel flags
               if has_kev:
                   clean_set.add("cisa-kev")
               if has_mal:
@@ -546,36 +583,55 @@ jobs:
 
               cwe = infer_cwe(svc, raw_title, existing_cwe)
               weakness_label = cwe_names.get(cwe, "")
-              is_secret_finding = (svc == "dependency-layer") and ("secret" in raw_title.lower() or cwe == 798)
+              is_secret_finding = (
+                  "secret detected" in raw_title.lower()
+                  or "asymmetric private key" in raw_title.lower()
+                  or "high entropy string" in raw_title.lower()
+                  or "ckv_secret_" in desc.lower()
+                  or (svc == "dependency-layer" and cwe == 798)
+              )
 
               eco = infer_osv_ecosystem(raw_tags, file_path)
               mal_hits = match_local_malware(eco, comp_name, comp_ver)
               mal_ids = [h["id"] for h in mal_hits]
 
-              # Cross-layer deduplication: close container-layer app lockfile CVEs already covered in dependency-layer
+              # Cross-layer deduplication: close container-layer app lockfile CVEs & repo secrets already in dependency-layer
               is_cross_layer_dup = False
-              if svc == "container-layer" and cve and comp_name:
+              if svc == "container-layer":
                   fp_low = file_path.lower()
-                  if any(p in fp_low for p in (
+                  if cve and comp_name and any(p in fp_low for p in (
                       "node_modules/", "vendor/", "site-packages/",
                       "package.json", "package-lock.json", "yarn.lock", "composer.lock", "requirements.txt"
                   )):
                       if (cve, comp_name.lower()) in dep_cve_pkgs:
                           is_cross_layer_dup = True
+                  elif is_secret_finding and file_path and os.path.basename(fp_low) in dep_secret_basenames:
+                      is_cross_layer_dup = True
 
-              # Clean vulnerability-only titles (CVE ID & File/Line already live in DefectDojo's dedicated columns)
+              # Clean title generation
+              has_pkg_vuln = (svc in ("dependency-layer", "container-layer")) and (bool(cve) or bool(adv_id_pattern.match(raw_title)))
+
               if mal_ids:
                   pkg_str = f"{comp_name}@{comp_ver}" if comp_ver else comp_name
                   clean_title = f"[MALICIOUS PACKAGE: {pkg_str}] Supply-Chain Malware"
-              elif svc in ("dependency-layer", "container-layer") and cve:
+              elif is_secret_finding and svc != "iac-cicd-layer":
+                  # Handle 'Secret Detected in /juice-shop/lib/insecurity.ts - Asymmetric Private Key' cleanly
+                  secret_type = raw_title
+                  if " - " in secret_type:
+                      secret_type = secret_type.split(" - ", 1)[1].strip()
+                  secret_type = re.sub(r"^(\[Exposed Secret\]\s*)+", "", secret_type, flags=re.IGNORECASE)
+                  secret_type = trailing_loc_re.sub("", secret_type).strip()
+                  clean_title = f"[Exposed Secret] {secret_type}"
+              elif has_pkg_vuln:
                   layer_prefix = "Container OS" if svc == "container-layer" else "Dependency"
                   pkg_str = f"{comp_name}@{comp_ver}" if (comp_name and comp_ver) else (comp_name or "Package")
-                  w_part = weakness_label or (kev_map[cve]["name"] if cve in kev_map else "Known Vulnerability")
+                  desc_summary = extract_summary_from_desc(desc, comp_name)
+                  w_part = (
+                      weakness_label
+                      or desc_summary
+                      or (kev_map[cve]["name"] if (cve and cve in kev_map) else "Security Advisory")
+                  )
                   clean_title = f"[{layer_prefix}: {pkg_str}] {w_part}"
-              elif is_secret_finding:
-                  base_secret = re.sub(r"^(\[Exposed Secret\]\s*)+", "", raw_title, flags=re.IGNORECASE)
-                  base_secret = trailing_loc_re.sub("", base_secret).strip()
-                  clean_title = f"[Exposed Secret] {base_secret}"
               elif svc == "code-layer":
                   cleaned = re.sub(r"^(\[SAST\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
                   cleaned = trailing_loc_re.sub("", cleaned).strip()
@@ -584,9 +640,8 @@ jobs:
                       cleaned = cleaned.split(".")[-1].replace("-", " ").title()
                   clean_title = f"[SAST] {cleaned}"
               elif svc == "iac-cicd-layer":
-                  cleaned_iac = re.sub(r"^(\[IaC / CI-CD\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
-                  cleaned_iac = trailing_loc_re.sub("", cleaned_iac).strip()
-                  clean_title = f"[IaC / CI-CD] {cleaned_iac}"
+                  # Keep Checkov's native clear rule titles untouched (strip any prior [IaC / CI-CD] prefix)
+                  clean_title = re.sub(r"^(\[IaC / CI-CD\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
               elif svc == "governance-posture":
                   cleaned_sc = re.sub(r"^(\[Supply Chain Posture\]\s*)+", "", raw_title, flags=re.IGNORECASE).strip()
                   short_sc = cleaned_sc.split("Remediation Tip:")[0].split("Warn:")[0].strip().rstrip(":")
@@ -598,25 +653,29 @@ jobs:
 
               clean_title = clean_title[:490]
 
-              # Fix Trivy's 'fixed' Impact placeholder and bare version Mitigation string
+              # Fix Trivy's 'fixed' Impact placeholder & populate Checkov/Governance Impact & Mitigation
               clean_impact = raw_impact
               if not clean_impact or clean_impact.lower() in ("fixed", "affected", "under_investigation", "will_not_fix"):
                   if cwe in cwe_impacts:
                       clean_impact = cwe_impacts[cwe]
                   elif svc in ("dependency-layer", "container-layer") and comp_name:
                       clean_impact = f"Vulnerable component '{comp_name}' may expose the application or runtime environment to exploitation."
+                  elif svc == "iac-cicd-layer":
+                      clean_impact = "Insecure infrastructure or CI/CD configuration weakens defense-in-depth and may expose services or secrets."
                   elif svc == "governance-posture":
                       clean_impact = "Weak repository or CI/CD governance controls increase the risk of unauthorized changes or supply-chain tampering."
 
               clean_mitigation = raw_mitigation
-              if svc in ("dependency-layer", "container-layer") and comp_name:
+              if svc in ("dependency-layer", "container-layer") and comp_name and not is_secret_finding:
                   if clean_mitigation and len(clean_mitigation) < 40 and not clean_mitigation.lower().startswith("upgrade"):
                       clean_mitigation = f"Upgrade '{comp_name}' to fixed version {clean_mitigation} (or later) and rebuild dependencies."
                   elif not clean_mitigation:
                       clean_mitigation = f"Check upstream advisories for '{comp_name}' and upgrade to a patched release or replace the unmaintained package."
+              elif svc == "iac-cicd-layer" and not clean_mitigation:
+                  clean_mitigation = f"Update the configuration in '{file_path}' to satisfy '{clean_title}' (refer to Checkov rule guidance)."
 
               merged_refs = filter_authoritative_refs(
-                  f.get("references") or "", cve, cwe, mal_ids, svc, file_path, line_no
+                  f.get("references") or "", cve, cwe, mal_ids, svc, file_path, line_no, is_secret_finding
               )
 
               # Balanced Human-in-the-Loop Severity & Priority Justification
@@ -677,14 +736,14 @@ jobs:
                       f"(Percentile: {pct_val * 100:.1f}% — higher than {pct_val * 100:.1f}% of all scored CVEs)."
                   )
               elif not cve:
-                  just_lines.append("- FIRST EPSS Score: N/A (Code/configuration weakness without a CVE; evaluated via CWE impact and code context).")
+                  just_lines.append("- FIRST EPSS Score: N/A (Code/configuration/secret weakness without a CVE; evaluated via CWE impact and context).")
 
               if cve:
                   just_lines.append(f"- Public Advisory Tracking: {cve} (see NVD/GHSA links in References).")
 
               severity_justification = raw_justification if human_override else "\n".join(just_lines)
 
-              # Build SCA False-Positive & Reachability Triage Guide in Steps To Reproduce (kept out of Tags)
+              # Build SCA False-Positive & Reachability Triage Guide in Steps To Reproduce
               steps_out = raw_steps
               if svc == "dependency-layer" and comp_name and not is_secret_finding:
                   p_low = comp_name.lower()
