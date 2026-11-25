@@ -8,7 +8,7 @@ on:
 
 jobs:
   normalize-findings:
-    name: Normalize Titles, Justification, SCA Reachability, EPSS, KEV & OSV (node-goat)
+    name: Normalize Titles, Tags, Justification, EPSS, KEV & OSV (node-goat)
     if: github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     permissions:
@@ -164,9 +164,9 @@ jobs:
               fp = file_path.lower()
               if "npm" in tset or "node-pkg" in tset or "package" in fp or "yarn.lock" in fp:
                   return "npm"
-              if "pip" in tset or "python" in tset or "requirements.txt" in fp or "poetry.lock" in fp:
+              if "pip" in tset or "pypi" in tset or "python" in tset or "requirements.txt" in fp or "poetry.lock" in fp:
                   return "PyPI"
-              if "composer" in tset or "php" in tset or "composer.lock" in fp:
+              if "composer" in tset or "packagist" in tset or "php" in tset or "composer.lock" in fp:
                   return "Packagist"
               if "maven" in tset or "gradle" in tset or "pom.xml" in fp:
                   return "Maven"
@@ -240,7 +240,7 @@ jobs:
                   seen_lock_hits.add(key)
                   mal_ids = sorted({h["id"] for h in hits})
                   lockfile_mal_findings.append({
-                      "title": f"[MALICIOUS PACKAGE: {pname}@{pver}] Supply-Chain Malware ({', '.join(mal_ids)})",
+                      "title": f"[MALICIOUS PACKAGE: {pname}@{pver}] Supply-Chain Malware",
                       "description": (
                           f"**[OSV MALICIOUS PACKAGE DETECTED: {', '.join(mal_ids)}]**\n"
                           f"{hits[0]['summary'][:500]}\n\n"
@@ -261,7 +261,7 @@ jobs:
                       "known_exploited": True,
                       "unique_id_from_tool": f"osv-mal-{eco}-{pname}-{pver}",
                       "vuln_id_from_tool": mal_ids[0],
-                      "tags": ["sca", "osv-malicious-package", "supply-chain-malware"]
+                      "tags": ["sca", eco.lower(), "osv-malicious-package"]
                   })
 
           print(f"Scanned {len(lockfile_packages)} lockfile package entries offline against OSV malware index.")
@@ -474,7 +474,44 @@ jobs:
 
               return "\n".join(clean_links[:6])
 
-          # Helper to strip trailing (filename:line) or (filename) suffixes from titles
+          def build_clean_tags(svc_name, existing_tags, eco_name, is_secret, has_kev, has_mal):
+              raw_set = {t.lower() for t in existing_tags}
+              clean_set = set()
+
+              # Keep any manual human-in-the-loop priority overrides
+              for manual_tag in ("priority-confirmed", "p0", "p1", "p2", "p3"):
+                  if manual_tag in raw_set:
+                      clean_set.add(manual_tag)
+
+              # Core category tags
+              if svc_name == "code-layer":
+                  clean_set.add("sast")
+              elif svc_name == "dependency-layer":
+                  clean_set.add("secrets" if is_secret else "sca")
+              elif svc_name == "container-layer":
+                  clean_set.add("container")
+              elif svc_name == "iac-cicd-layer":
+                  clean_set.add("iac")
+                  clean_set.add("cicd")
+              elif svc_name == "governance-posture":
+                  clean_set.add("cicd")
+                  clean_set.add("scorecard")
+
+              # Package / OS ecosystem tag (e.g., npm, pypi, packagist, alpine, debian)
+              if eco_name:
+                  clean_set.add(eco_name.lower())
+              for os_tag in ("alpine", "debian", "ubuntu", "redhat", "maven", "go", "cargo"):
+                  if os_tag in raw_set:
+                      clean_set.add(os_tag)
+
+              # High-signal threat intel flags
+              if has_kev:
+                  clean_set.add("cisa-kev")
+              if has_mal:
+                  clean_set.add("osv-malicious-package")
+
+              return sorted(clean_set)
+
           trailing_loc_re = re.compile(r"(?:\s*\([^()]+\.(?:js|jsx|ts|tsx|mjs|cjs|py|php|go|java|rb|yml|yaml|json|tf|sh|html|css)(?::[0-9]+)?\))+$", re.IGNORECASE)
 
           updated_count = 0
@@ -498,10 +535,8 @@ jobs:
               comp_name = (f.get("component_name") or "").strip()
               comp_ver = (f.get("component_version") or "").strip()
               existing_cwe = f.get("cwe")
+              raw_tags = list(f.get("tags") or [])
               sev = f.get("severity", "Medium")
-
-              # Remove noisy 'normalized' tag if present from earlier runs
-              tags = [t for t in (f.get("tags") or []) if t.lower() != "normalized"]
 
               cve = (f.get("cve") or "").upper()
               if not cve:
@@ -511,29 +546,33 @@ jobs:
 
               cwe = infer_cwe(svc, raw_title, existing_cwe)
               weakness_label = cwe_names.get(cwe, "")
+              is_secret_finding = (svc == "dependency-layer") and ("secret" in raw_title.lower() or cwe == 798)
 
-              eco = infer_osv_ecosystem(tags, file_path)
+              eco = infer_osv_ecosystem(raw_tags, file_path)
               mal_hits = match_local_malware(eco, comp_name, comp_ver)
               mal_ids = [h["id"] for h in mal_hits]
 
-              # Cross-layer deduplication
+              # Cross-layer deduplication: close container-layer app lockfile CVEs already covered in dependency-layer
               is_cross_layer_dup = False
               if svc == "container-layer" and cve and comp_name:
                   fp_low = file_path.lower()
-                  if any(p in fp_low for p in ("node_modules/", "vendor/", "site-packages/", "package.json")):
+                  if any(p in fp_low for p in (
+                      "node_modules/", "vendor/", "site-packages/",
+                      "package.json", "package-lock.json", "yarn.lock", "composer.lock", "requirements.txt"
+                  )):
                       if (cve, comp_name.lower()) in dep_cve_pkgs:
                           is_cross_layer_dup = True
 
-              # Clean vulnerability-only titles (File Path and Line already live in DefectDojo's native columns)
+              # Clean vulnerability-only titles (CVE ID & File/Line already live in DefectDojo's dedicated columns)
               if mal_ids:
                   pkg_str = f"{comp_name}@{comp_ver}" if comp_ver else comp_name
-                  clean_title = f"[MALICIOUS PACKAGE: {pkg_str}] Supply-Chain Malware ({', '.join(mal_ids)})"
+                  clean_title = f"[MALICIOUS PACKAGE: {pkg_str}] Supply-Chain Malware"
               elif svc in ("dependency-layer", "container-layer") and cve:
                   layer_prefix = "Container OS" if svc == "container-layer" else "Dependency"
                   pkg_str = f"{comp_name}@{comp_ver}" if (comp_name and comp_ver) else (comp_name or "Package")
                   w_part = weakness_label or (kev_map[cve]["name"] if cve in kev_map else "Known Vulnerability")
-                  clean_title = f"[{layer_prefix}: {pkg_str}] {w_part} ({cve})"
-              elif svc == "dependency-layer" and ("secret" in raw_title.lower() or cwe == 798):
+                  clean_title = f"[{layer_prefix}: {pkg_str}] {w_part}"
+              elif is_secret_finding:
                   base_secret = re.sub(r"^(\[Exposed Secret\]\s*)+", "", raw_title, flags=re.IGNORECASE)
                   base_secret = trailing_loc_re.sub("", base_secret).strip()
                   clean_title = f"[Exposed Secret] {base_secret}"
@@ -585,7 +624,7 @@ jobs:
               pct_val = epss_map[cve]["percentile"] if (cve and cve in epss_map) else None
               kev_info = kev_map.get(cve) if cve else None
 
-              lower_tags = {t.lower() for t in tags}
+              lower_tags = {t.lower() for t in raw_tags}
               human_override = any(t in lower_tags for t in ("priority-confirmed", "p0", "p1", "p2", "p3"))
 
               if mal_hits or kev_info:
@@ -645,9 +684,9 @@ jobs:
 
               severity_justification = raw_justification if human_override else "\n".join(just_lines)
 
-              # Build SCA False-Positive & Reachability Triage Guide in Steps To Reproduce
+              # Build SCA False-Positive & Reachability Triage Guide in Steps To Reproduce (kept out of Tags)
               steps_out = raw_steps
-              if svc == "dependency-layer" and comp_name:
+              if svc == "dependency-layer" and comp_name and not is_secret_finding:
                   p_low = comp_name.lower()
                   is_dev = (p_low in direct_dev_pkgs or p_low in lock_dev_pkgs) and (p_low not in direct_prod_pkgs)
                   is_direct = (p_low in direct_prod_pkgs) or (p_low in direct_dev_pkgs)
@@ -656,22 +695,13 @@ jobs:
                   scope_str = "Dev/Build-Only Dependency (devDependencies — does NOT ship in production runtime)" if is_dev else "Runtime / Production Dependency"
                   rel_str = "Direct Dependency (declared in package.json / lockfile root)" if is_direct else "Transitive Dependency (pulled in indirectly by another package)"
 
-                  if is_dev and "dev-only-dependency" not in tags:
-                      tags.append("dev-only-dependency")
-                  if not is_direct and "transitive-dependency" not in tags:
-                      tags.append("transitive-dependency")
-
                   if import_hits:
                       reach_str = f"Directly imported in first-party source files: {', '.join(import_hits)}. Verify whether user-controlled input reaches the vulnerable function."
-                      if "direct-import" not in tags:
-                          tags.append("direct-import")
                   else:
                       reach_str = (
                           f"No direct 'require/import' of '{comp_name}' found in first-party source code. "
                           "Likely a transitive sub-dependency—check whether the parent library actually invokes the vulnerable function in your runtime paths."
                       )
-                      if "unreferenced-in-source" not in tags:
-                          tags.append("unreferenced-in-source")
 
                   triage_guide = (
                       f"**Automated SCA Reachability & False-Positive Check:**\n"
@@ -686,13 +716,20 @@ jobs:
                   if not steps_out or "**Automated SCA Reachability & False-Positive Check:**" in steps_out:
                       steps_out = triage_guide
 
+              clean_tags = build_clean_tags(
+                  svc, raw_tags, eco, is_secret_finding, bool(kev_info), bool(mal_hits)
+              )
+
               patch_data = {
                   "title": clean_title,
                   "references": merged_refs,
                   "severity_justification": severity_justification,
                   "known_exploited": bool(f.get("known_exploited", False)),
                   "ransomware_used": bool(f.get("ransomware_used", False)),
+                  "tags": clean_tags,
               }
+              if cve and not f.get("cve"):
+                  patch_data["cve"] = cve
               if cwe:
                   patch_data["cwe"] = cwe
               if clean_impact:
@@ -706,8 +743,6 @@ jobs:
               if mal_hits:
                   patch_data["severity"] = "Critical"
                   patch_data["known_exploited"] = True
-                  if "osv-malicious-package" not in tags:
-                      tags.append("osv-malicious-package")
                   mal_flagged_count += 1
                   mal_summary = mal_hits[0]["summary"][:300]
                   banner_notes.append(
@@ -717,8 +752,6 @@ jobs:
               if epss_val is not None:
                   patch_data["epss_score"] = round(epss_val, 5)
                   patch_data["epss_percentile"] = round(pct_val, 5)
-                  if epss_val >= 0.10 and "high-epss" not in tags:
-                      tags.append("high-epss")
                   banner_notes.append(f"**EPSS Exploit Probability:** {epss_val * 100:.2f}% (Percentile: {pct_val * 100:.1f}%)")
 
               if kev_info:
@@ -726,8 +759,6 @@ jobs:
                   patch_data["ransomware_used"] = kev_info["ransomware"]
                   if kev_info["dateAdded"]:
                       patch_data["kev_date"] = kev_info["dateAdded"]
-                  if "cisa-kev" not in tags:
-                      tags.append("cisa-kev")
                   banner_notes.append(
                       f"**[CISA KEV ACTIVE EXPLOITATION]** Added: {kev_info['dateAdded']} | "
                       f"Ransomware Campaign Use: {'Yes' if kev_info['ransomware'] else 'Unknown'} | "
@@ -737,11 +768,7 @@ jobs:
               if is_cross_layer_dup:
                   patch_data["active"] = False
                   patch_data["is_mitigated"] = True
-                  if "cross-layer-deduped" not in tags:
-                      tags.append("cross-layer-deduped")
                   deduped_count += 1
-
-              patch_data["tags"] = tags
 
               if banner_notes and "EPSS Exploit Probability:" not in desc and "[OSV MALICIOUS PACKAGE" not in desc:
                   patch_data["description"] = "\n".join(banner_notes) + "\n\n" + desc
@@ -763,7 +790,7 @@ jobs:
             -F "scan_type=Generic Findings Import" \
             -F "test_title=OSV Offline Supply-Chain Malware Check" \
             -F "service=dependency-layer" \
-            -F "tags=sca,osv-malicious-package,supply-chain-malware" \
+            -F "tags=sca,osv-malicious-package" \
             -F "file=@osv-malware-import.json" \
             -F "product_name=node-goat" \
             -F "product_type_name=GitHub Repositories" \
